@@ -42,6 +42,8 @@ TABLES = [
 WORKFLOW = re.compile(r"[\w][\w.\-/]{0,200}")
 MAX_BYTES = 256 * 1024 * 1024
 SQLITE_HEADER = b"SQLite format 3\x00"
+# Columns the views read that older uploaders' snapshots lack: added (empty) if missing.
+VIEW_COLUMNS = {"job_resources": ["runner", "chunks"]}
 
 
 def quote(name: str) -> str:
@@ -173,6 +175,11 @@ def views(conn: sqlite3.Connection) -> None:
     """
     if conn.execute("select 1 from sqlite_master where name = 'monitor'").fetchone():
         with conn:
+            for table, needed in VIEW_COLUMNS.items():
+                existing = [r[1] for r in conn.execute(f"pragma main.table_info({quote(table)})")]
+                for column in needed:
+                    if existing and column not in existing:
+                        conn.execute(f"alter table main.{quote(table)} add column {quote(column)}")
             for statement in SCHEMA.read_text().split(";\n"):
                 if statement.strip():
                     conn.execute(statement)

@@ -93,7 +93,7 @@ later.
    that lists the plugin won't start where the plugin isn't installed, so the
    `global.cylc` route keeps a workflow's `flow.cylc` portable. `cylc config -i
    '[scheduler][main loop]'` shows what Cylc reads.
-4. **Optionally, turn on Cylc's job profiler** for your Slurm platform (see
+4. **Optionally, turn on Cylc's job profiler** for your Slurm or PBS platform (see
    [What each job used](#what-each-job-used-cylcs-profiler)).
 
 A scheduler already running before this picks the plugin up when it restarts.
@@ -125,11 +125,29 @@ read-only connection, plus three tables:
 
 - `monitor`: the scheduler's state (`running`, `paused`, `stalled` or `stopped`),
   host, PID, the upload time and the heartbeat interval.
-- `job_resources`: each job's `#SBATCH` directives, read from its job script
-  (`log/job/<cycle>/<task>/<NN>/job`). That covers:
+- `job_resources`: each job's directives, read from its job script
+  (`log/job/<cycle>/<task>/<NN>/job`). The job runner is told by the first directive:
+  `#SBATCH` is Slurm, `#PBS` is PBS (PBS Pro, or Torque), recorded as `runner`. A job
+  with neither, such as a background job, has only empty columns. For Slurm:
   - cores (ntasks × cpus-per-task);
   - nodes (the minimum, for a range);
   - memory, time limit, account and partition.
+
+  For PBS, from `-l select=N:ncpus=C:mpiprocs=P:ompthreads=T:mem=M` (chunks joined by
+  `+` are summed; `-l` may come combined, `-l select=...,place=...`, or on several lines):
+  - cores: the total `ncpus` (N × C, 1 a chunk if not given). See the SMT caveat in
+    [The views](#the-views-and-the-dashboard);
+  - `ntasks`: the total `mpiprocs`, and `cpus_per_task`: `ompthreads`, if every chunk
+    gives the same;
+  - `chunks`: the chunk count. `nodes` is 1 for one chunk or `place=pack`, the chunk
+    count for `place=scatter`, and empty otherwise, since PBS may put several chunks on
+    one host;
+  - memory: `mem` summed over chunks (PBS units, `b` to `pb`, bare numbers in bytes);
+  - time limit: `-l walltime` (Cylc writes its `execution time limit` in seconds);
+  - account: `-A`, else `-P`; partition: the queue, `-q`.
+
+  Without a select, PBS's job-wide `-l ncpus` and `-l mem`, or Torque's
+  `-l nodes=N:ppn=C`, are read instead.
 - `job_logs`: the last 20 lines of `job.err` for each failed job.
 
 The server merges the snapshot into its own `cylc` database in one transaction. Each
@@ -150,8 +168,8 @@ A `stat` of one file every 30 s, from inside the scheduler. When the file has ch
 - a read of each new job script's header;
 - one HTTPS POST of the gzipped snapshot.
 
-It makes no Slurm calls. What a job asked for comes from its job script, and what it
-used from Cylc's profiler.
+It makes no Slurm or PBS calls. What a job asked for comes from its job script, and what
+it used from Cylc's profiler.
 
 ## What each job used: Cylc's profiler
 
@@ -174,7 +192,12 @@ stores that in `task_events`, and the `jobs` view turns it into `max_rss_gb`,
   CPU time cover that first node only, so `cpu_efficiency` is given only for jobs that
   asked for `--nodes=1`.
 - It finds the job's cgroup by a path with a six-or-more-digit number in it, such as
-  Slurm's `job_<id>`. Background jobs on a desktop don't have one.
+  Slurm's `job_<id>`. Background jobs on a desktop don't have one. Under PBS Pro, the
+  job's cgroup exists only where the site runs PBS's cgroup hook. Its path then holds
+  the job ID, as in `/pbs_jobs.service/jobid/1234567.<server>`, so the lookup works
+  when job IDs have six or more digits. It fails for shorter IDs or without the hook,
+  and the profiler then reports nothing. To check a site, run `cat /proc/self/cgroup`
+  in a job.
 - It applies to jobs submitted after the change.
 
 ## The views and the dashboard
@@ -187,7 +210,16 @@ stores that in `task_events`, and the `jobs` view turns it into `max_rss_gb`,
   - `core_hours` = cores × hours running;
   - `rsu` = (1.4 × cores + 0.20 × GB requested) × hours, REANNZ's rates.
 
-  A job's time so far stops at its workflow's last upload.
+  A job's time so far stops at its workflow's last upload. `runner` is `slurm`, `pbs`
+  or empty, and `chunks` is a PBS job's select chunk count.
+
+  A PBS job's `cores` is the `ncpus` it asked for, as PBS counts them. Where `ncpus`
+  counts both SMT threads of each core, as on ESNZ's Cascade, that is twice the
+  physical cores. A whole-node Cascade job (`select=8:ncpus=384:mpiprocs=48:ompthreads=4`)
+  shows 3072 cores, not the 1536 physical cores its 384 ranks × 4 threads use. Its
+  `core_hours`, `rsu` and `cpu_efficiency` follow, so halve them for physical cores.
+  The monitor doesn't apply a site factor, because a site's `ncpus` may count either.
+  `ntasks` × `cpus_per_task` in `job_resources` is what the job planned to use.
 - `workflows`: one row a workflow. `health` is the scheduler's last state, or `silent`
   when a scheduler not stopped hasn't uploaded for three heartbeats. It also counts the
   jobs by state and totals core-hours and RSUs.
@@ -220,7 +252,7 @@ every token.
 
 - The workflow's public database (`log/db`). That holds task names, cycle points, job
   IDs and times, task outputs and messages, and workflow parameters.
-- The `#SBATCH` lines of each job script.
+- The `#SBATCH` or `#PBS` lines of each job script.
 - The last 20 lines of `job.err` of each failed job.
 - The scheduler host's name and the scheduler's PID.
 
@@ -302,7 +334,10 @@ release builds the package and publishes it to PyPI (`.github/workflows/publish-
 The version comes from the release's tag (setuptools-scm).
 
 `tests/data/run` is a real Cylc 8.7.0 run directory, its `log/db` and job scripts.
-The run had the profiler on and a stand-in Slurm. The tests cover:
+The run had the profiler on and a stand-in Slurm. `tests/data/pbs` holds the same run's
+`sim` job scripts as Cylc 8.7's PBS job runner writes them, synthesised, not from a real
+PBS run. The tests lay them over the run for a PBS workflow. The tests cover:
+- `tests/test_upload.py`: the Slurm and PBS directives, and the snapshot.
 - `tests/test_mainloop.py`: the plugin, driven as the scheduler drives it.
 - `tests/test_server.py`: it starts the server on a temporary database and checks:
   - the permissions;
