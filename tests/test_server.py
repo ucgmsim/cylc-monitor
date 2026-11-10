@@ -24,6 +24,7 @@ from cylc_monitor import status, upload
 
 SERVER = Path(__file__).resolve().parent.parent / "server"
 RUN = Path(__file__).resolve().parent / "data" / "run"
+PBS = Path(__file__).resolve().parent / "data" / "pbs"
 SECRET = "test-secret"
 
 
@@ -101,10 +102,12 @@ def sql(monitor: dict, query: str) -> list[dict]:
     return json.loads(body)
 
 
-def snapshot(tmp_path: Path, workflow: str, state: str = "running") -> Path:
+def snapshot(tmp_path: Path, workflow: str, state: str = "running", pbs: bool = False) -> Path:
     run = tmp_path / workflow.replace("/", "_")
     if not run.exists():
         shutil.copytree(RUN, run)
+        if pbs:  # the sim jobs' scripts as Cylc's PBS job runner writes them
+            shutil.copytree(PBS, run, dirs_exist_ok=True)
     path = tmp_path / f"{run.name}.db"
     path.unlink(missing_ok=True)
     upload.Snapshot(run, workflow, 300).build(path, state, "host", 1)
@@ -171,6 +174,47 @@ def test_jobs_view(monitor: dict, tmp_path: Path) -> None:
         (2, "succeeded"),
     ]
     assert "first try fails" in flaky[0]["job_err"]
+
+
+def test_jobs_view_pbs(monitor: dict, tmp_path: Path) -> None:
+    upload.upload(monitor["url"], monitor["writer"], "w/pbs", snapshot(tmp_path, "w/pbs", "stopped", pbs=True))
+    sims = sql(
+        monitor,
+        "select cycle, runner, cores, nodes, chunks, mem_gb, time_limit_min, account, partition, run_s, core_hours, rsu"
+        " from jobs where workflow = 'w/pbs' and name = 'sim' order by cycle",
+    )
+    whole, part = sims
+    assert (whole["runner"], whole["cores"], whole["nodes"], whole["chunks"], whole["mem_gb"]) == (
+        "pbs",
+        768,
+        2,
+        2,
+        1400,
+    )
+    assert (whole["time_limit_min"], whole["account"], whole["partition"]) == (10, "test0001", "high_mem_shortq")
+    assert whole["core_hours"] == pytest.approx(768 * whole["run_s"] / 3600, abs=0.01)
+    assert whole["rsu"] == pytest.approx((1.4 * 768 + 0.2 * 1400) * whole["run_s"] / 3600, abs=0.01)
+    assert (part["runner"], part["cores"], part["nodes"], part["mem_gb"]) == ("pbs", 8, 1, 3.91)
+    # Slurm jobs alongside are as they were.
+    assert (
+        sql(monitor, "select runner, chunks from jobs where workflow = 'w/run2' and name = 'sim'")
+        == [{"runner": "slurm", "chunks": None}] * 2
+    )
+
+
+def test_views_over_an_older_uploaders_tables(tmp_path: Path) -> None:
+    import sqlite3
+
+    import cylc_upload
+
+    path = snapshot(tmp_path, "w/old")
+    with sqlite3.connect(path) as old:  # as an uploader from before PBS support made it
+        old.execute("alter table job_resources drop column runner")
+        old.execute("alter table job_resources drop column chunks")
+    conn = sqlite3.connect(f"file:{tmp_path / 'cylc.db'}", uri=True, isolation_level=None)  # as Datasette does
+    cylc_upload.merge(conn, str(path), "w/old")
+    rows = conn.execute("select cores, runner, chunks from jobs where name = 'sim'").fetchall()
+    assert rows == [(8, None, None)] * 2
 
 
 def test_dashboard_queries_run(monitor: dict) -> None:

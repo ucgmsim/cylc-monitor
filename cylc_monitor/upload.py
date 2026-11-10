@@ -10,8 +10,8 @@ A snapshot is a consistent copy of <run dir>/log/db (SQLite's backup API, read-o
 plus three small tables of its own:
     monitor        one row: the scheduler's state (running, paused, stalled, stopped),
                    host, PID, upload time and the heartbeat interval;
-    job_resources  each job's Slurm directives, read from its job script
-                   (log/job/<cycle>/<task>/<NN>/job): what the job asked for;
+    job_resources  each job's Slurm (#SBATCH) or PBS (#PBS) directives, read from its
+                   job script (log/job/<cycle>/<task>/<NN>/job): what the job asked for;
     job_logs       the end of job.err for each job that failed.
 The monitor merges it into its own database, replacing the workflow's previous one.
 
@@ -41,6 +41,8 @@ TOKEN_FILE = "~/.config/cylc-monitor/token"
 # `silent` after three of these without one.
 HEARTBEAT_S = 300
 DIRECTIVE = re.compile(r"^#SBATCH\s+(--?[\w-]+)(?:[= ]\s*(\S+))?")
+# The prefix of each job runner's directives, as Cylc writes them.
+PREFIXES = {"#SBATCH": "slurm", "#PBS": "pbs"}
 # Short Slurm options and the long ones they stand for.
 SHORT = {
     "-n": "--ntasks",
@@ -62,6 +64,8 @@ RESOURCES = [
     "account",
     "partition",
     "directives",
+    "runner",
+    "chunks",
 ]
 
 
@@ -128,6 +132,38 @@ def megabytes(value: str) -> float | None:
     return float(match.group(1)) * scale
 
 
+def header(job_script: Path) -> tuple[str | None, list[str]]:
+    """Read the directives at the top of a job script, and the job runner they are for.
+
+    Parameters
+    ----------
+    job_script : Path
+        The job script Cylc wrote (log/job/<cycle>/<task>/<NN>/job).
+
+    Returns
+    -------
+    tuple[str or None, list[str]]
+        The job runner (slurm or pbs, from the first directive's prefix; None if the
+        script is missing or has none) and its directive lines, prefix and all. Lines
+        with the other runner's prefix are left out.
+    """
+    runner: str | None = None
+    lines: list[str] = []
+    try:
+        with job_script.open(errors="replace") as handle:
+            for line in handle:
+                prefix = line.split(maxsplit=1)[0] if line.strip() else ""
+                if prefix in PREFIXES:
+                    runner = runner or PREFIXES[prefix]
+                    if PREFIXES[prefix] == runner:
+                        lines.append(line.strip())
+                elif lines and line.strip() and not line.startswith("#"):
+                    break  # past the header
+    except OSError:
+        pass
+    return runner, lines
+
+
 def directives(job_script: Path) -> dict[str, str]:
     """Read the #SBATCH directives at the top of a job script.
 
@@ -140,26 +176,37 @@ def directives(job_script: Path) -> dict[str, str]:
     -------
     dict[str, str]
         Each directive's long option (short ones translated) and its value, empty for
-        a flag. Empty if the script is missing or has none.
+        a flag. Empty if the script is missing or has no #SBATCH directives.
+    """
+    runner, lines = header(job_script)
+    return slurm_directives(lines) if runner == "slurm" else {}
+
+
+def slurm_directives(lines: list[str]) -> dict[str, str]:
+    """Parse #SBATCH lines.
+
+    Parameters
+    ----------
+    lines : list[str]
+        The #SBATCH lines.
+
+    Returns
+    -------
+    dict[str, str]
+        Each directive's long option (short ones translated) and its value, empty for
+        a flag.
     """
     found: dict[str, str] = {}
-    try:
-        with job_script.open(errors="replace") as lines:
-            for line in lines:
-                if line.startswith("#SBATCH"):
-                    match = DIRECTIVE.match(line.strip())
-                    if match:
-                        option = SHORT.get(match.group(1), match.group(1))
-                        found[option] = match.group(2) or ""
-                elif found and line.strip() and not line.startswith("#"):
-                    break  # past the header
-    except OSError:
-        pass
+    for line in lines:
+        match = DIRECTIVE.match(line)
+        if match:
+            option = SHORT.get(match.group(1), match.group(1))
+            found[option] = match.group(2) or ""
     return found
 
 
 def resources(job_script: Path) -> dict[str, int | float | str | None]:
-    """Work out what a job asked Slurm for, from its job script.
+    """Work out what a job asked its job runner for, from its job script.
 
     Parameters
     ----------
@@ -169,12 +216,32 @@ def resources(job_script: Path) -> dict[str, int | float | str | None]:
     Returns
     -------
     dict[str, int or float or str or None]
+        The RESOURCES columns, from slurm_resources or pbs_resources by the script's
+        directives. All None but `runner` (and that too, without directives) for a
+        script with none, such as a background job's.
+    """
+    runner, lines = header(job_script)
+    if runner == "pbs":
+        return pbs_resources(lines)
+    return slurm_resources(slurm_directives(lines))
+
+
+def slurm_resources(d: dict[str, str]) -> dict[str, int | float | str | None]:
+    """Work out what a job asked Slurm for, from its #SBATCH directives.
+
+    Parameters
+    ----------
+    d : dict[str, str]
+        The directives, as slurm_directives reads them.
+
+    Returns
+    -------
+    dict[str, int or float or str or None]
         The RESOURCES columns: cores (ntasks x cpus-per-task), ntasks, cpus_per_task,
         nodes (the minimum, for a range), mem_mb (per CPU x cores, or per node x
-        nodes), time_limit_min, account, partition, and every directive as text.
-        None where the script doesn't say.
+        nodes), time_limit_min, account, partition, and every directive as text;
+        runner slurm and chunks None. None where the script doesn't say.
     """
-    d = directives(job_script)
 
     def integer(key: str) -> int | None:
         """Read an integer directive, the lower end of a range (e.g. --nodes=5-10).
@@ -215,6 +282,188 @@ def resources(job_script: Path) -> dict[str, int | float | str | None]:
         "account": d.get("--account"),
         "partition": d.get("--partition"),
         "directives": " ".join(f"{k}={v}" if v else k for k, v in d.items()) or None,
+        "runner": "slurm" if d else None,
+        "chunks": None,
+    }
+
+
+# --- PBS ---------------------------------------------------------------------------
+
+
+def pbs_minutes(value: str) -> float | None:
+    """Convert a PBS walltime to minutes.
+
+    Parameters
+    ----------
+    value : str
+        The walltime as PBS takes it: [[HH:]MM:]SS, each part optionally fractional.
+        Cylc writes its execution time limit as whole seconds (e.g. 3600).
+
+    Returns
+    -------
+    float or None
+        The walltime in minutes, or None if `value` isn't one.
+    """
+    try:
+        parts = [float(p) for p in value.split(":")]
+    except ValueError:
+        return None
+    if not 1 <= len(parts) <= 3:
+        return None
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60 + part
+    return seconds / 60
+
+
+def pbs_megabytes(value: str) -> float | None:
+    """Convert a PBS size to megabytes.
+
+    Parameters
+    ----------
+    value : str
+        The size as PBS takes it: an integer with an optional b, kb, mb, gb, tb or pb
+        suffix, in either case (default bytes). 1kb is 1024 bytes. Sizes in words
+        (w, kw, ...) aren't converted.
+
+    Returns
+    -------
+    float or None
+        The size in MB, or None if `value` isn't a size in bytes.
+    """
+    match = re.fullmatch(r"(\d+)([kmgtp]?b)?", value.lower())
+    if not match:
+        return None
+    exponent = {None: -2, "b": -2, "kb": -1, "mb": 0, "gb": 1, "tb": 2, "pb": 3}[match.group(2)]
+    return int(match.group(1)) * 1024.0**exponent
+
+
+def pbs_directives(lines: list[str]) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """Parse #PBS lines into options and -l resources.
+
+    Parameters
+    ----------
+    lines : list[str]
+        The #PBS lines. Each may hold several options (`#PBS -q q -l walltime=60`); a
+        -l value may hold several resources joined by commas (`-l select=...,place=...`),
+        and -l may be given on several lines.
+
+    Returns
+    -------
+    tuple[list[tuple[str, str]], dict[str, str]]
+        Every option and its value (empty for a flag) in order, -l ones included, and
+        the -l resources by name (a later one replacing an earlier).
+    """
+    options: list[tuple[str, str]] = []
+    limits: dict[str, str] = {}
+    for line in lines:
+        words = line.split()[1:]
+        i = 0
+        while i < len(words):
+            option, value = words[i], ""
+            if not option.startswith("-"):
+                i += 1
+                continue
+            if i + 1 < len(words) and not words[i + 1].startswith("-"):
+                value = words[i + 1]
+                i += 1
+            i += 1
+            options.append((option, value))
+            if option == "-l":
+                for item in value.split(","):
+                    name, _, setting = item.partition("=")
+                    if name:
+                        limits[name] = setting
+    return options, limits
+
+
+def pbs_resources(lines: list[str]) -> dict[str, int | float | str | None]:
+    """Work out what a job asked PBS for, from its #PBS directives.
+
+    PBS Pro's `select=N:ncpus=C:mpiprocs=P:ompthreads=T:mem=M` asks for N chunks, each
+    of C CPUs and M memory; chunks joined by `+` are summed. Without a select, the
+    job-wide `-l ncpus` and `-l mem`, or Torque's `-l nodes=N:ppn=C`, are read instead.
+    A chunk without ncpus has PBS's default, 1. The job-wide `-l mem` is read only when
+    the select doesn't give every chunk's mem.
+
+    Parameters
+    ----------
+    lines : list[str]
+        The #PBS lines.
+
+    Returns
+    -------
+    dict[str, int or float or str or None]
+        The RESOURCES columns: cores (the total ncpus, as PBS counts them: hardware
+        threads on a site that counts SMT siblings), ntasks (total mpiprocs),
+        cpus_per_task (ompthreads, if every chunk gives the same), chunks, nodes (1 for
+        one chunk or place=pack, the chunks for place=scatter, else None, since PBS may
+        put several chunks on one host), mem_mb (summed over chunks, if every chunk
+        gives one), time_limit_min (walltime), account (-A, else -P), partition (the
+        queue, -q), every directive as text, and runner pbs. None where the script
+        doesn't say.
+    """
+    options, limits = pbs_directives(lines)
+    flags = dict(options)
+    cores: int | None = None
+    ntasks: int | None = None
+    threads: set[int | None] = set()
+    chunks: int | None = None
+    nodes: int | None = None
+    mem_mb: float | None = None
+    no_mem = False
+    try:
+        if "select" in limits:
+            cores, chunks = 0, 0
+            for chunk in limits["select"].split("+"):
+                count, *settings = chunk.split(":")
+                if "=" in count:  # no chunk count: one chunk
+                    settings.insert(0, count)
+                    count = "1"
+                n = int(count)
+                spec = dict(s.partition("=")[::2] for s in settings)
+                chunks += n
+                cores += n * int(spec.get("ncpus", 1))
+                if "mpiprocs" in spec:
+                    ntasks = (ntasks or 0) + n * int(spec["mpiprocs"])
+                threads.add(int(spec["ompthreads"]) if "ompthreads" in spec else None)
+                if "mem" in spec:
+                    size = pbs_megabytes(spec["mem"])
+                    if size is None:
+                        raise ValueError(spec["mem"])
+                    mem_mb = (mem_mb or 0) + n * size
+                else:
+                    no_mem = True
+            if no_mem:  # some chunks get the site's default: unknown
+                mem_mb = None
+            place = limits.get("place", "").split(":")
+            nodes = 1 if chunks == 1 or "pack" in place else chunks if "scatter" in place else None
+        elif "nodes" in limits:  # Torque: nodes=N:ppn=C
+            count, *settings = limits["nodes"].split(":")
+            spec = dict(s.partition("=")[::2] for s in settings)
+            nodes = chunks = int(count) if count.isdigit() else None
+            if nodes is not None:
+                cores = nodes * int(spec.get("ppn", 1))
+    except ValueError:  # a select or nodes PBS wouldn't take: say nothing of it
+        cores = ntasks = chunks = nodes = mem_mb = None
+        threads.clear()
+    if cores is None and "ncpus" in limits and limits["ncpus"].isdigit():
+        cores = int(limits["ncpus"])
+    if mem_mb is None and "mem" in limits:
+        mem_mb = pbs_megabytes(limits["mem"])
+    walltime = limits.get("walltime")
+    return {
+        "cores": cores,
+        "ntasks": ntasks,
+        "cpus_per_task": threads.pop() if len(threads) == 1 else None,
+        "nodes": nodes,
+        "mem_mb": mem_mb,
+        "time_limit_min": pbs_minutes(walltime) if walltime else None,
+        "account": flags.get("-A") or flags.get("-P") or None,
+        "partition": flags.get("-q") or None,
+        "directives": " ".join(f"{k} {v}" if v else k for k, v in options) or None,
+        "runner": "pbs",
+        "chunks": chunks,
     }
 
 
