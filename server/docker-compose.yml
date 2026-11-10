@@ -1,0 +1,29 @@
+# The Cylc monitor: Datasette on 127.0.0.1:8017 (put a reverse proxy with TLS in front,
+# e.g. Caddyfile.example), its database in ./data/cylc.db. See ../README.md.
+#
+#   cp env.example .env && chmod 600 .env && $EDITOR .env   # once: the secret and password hash
+#   sudo docker compose up -d --build
+services:
+  init:
+    build: .
+    # Create the tables and views if they aren't there; then exit.
+    command: python -c "import sqlite3; c = sqlite3.connect('/data/cylc.db'); c.executescript(open('/app/schema.sql').read()); c.close()"
+    volumes:
+      - ./data:/data
+  datasette:
+    build: .
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    command: >
+      datasette serve /data/cylc.db --config /app/datasette.yaml --plugins-dir /app/plugins --template-dir /app/templates
+      --host 0.0.0.0 --port 8001
+      --setting sql_time_limit_ms 3000 --setting max_returned_rows 5000
+    environment:
+      DATASETTE_SECRET: ${DATASETTE_SECRET:?set DATASETTE_SECRET in .env}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?set ADMIN_PASSWORD_HASH in .env}
+    ports:
+      - "127.0.0.1:8017:8001"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

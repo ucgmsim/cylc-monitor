@@ -1,0 +1,42 @@
+# The monitor's Datasette: nothing for anonymous visitors. Three actors:
+#   admin        a person in the browser, logged in at /-/login (datasette-auth-passwords)
+#   cylc-writer  cylc_monitor_event.py and cylc_monitor_heartbeat.py on the scheduler host:
+#                a token that may only add events and upsert heartbeats
+#                (make_token.py writer: create-token --resource ... insert-row/update-row)
+#   cylc-reader  whoever follows the runs off the cluster (a person's script, an agent):
+#                a token that may only read and run read-only SQL (make_token.py reader)
+title: Cylc monitor
+description: Cylc workflow events and scheduler heartbeats, posted by the workflows' own event handlers.
+allow:
+  id: [admin, cylc-reader, cylc-writer]
+databases:
+  cylc:
+    tables:
+      events:
+        permissions:
+          insert-row:
+            id: cylc-writer
+      heartbeats:
+        permissions:
+          insert-row:
+            id: cylc-writer
+          update-row:
+            id: cylc-writer
+plugins:
+  datasette-auth-passwords:
+    admin_password_hash:
+      $env: ADMIN_PASSWORD_HASH
+  # The status page (plugins/cylc_status.py).
+  cylc-status:
+    # Fold tasks into one grid column. Each rule's `match` is a regular expression that
+    # must match the whole task name; the first rule that matches names the column, and
+    # `column` may use the match's groups (\1, \g<name>). A task no rule matches is its
+    # own column. With no rules (the default) every task is its own column.
+    # For example, one SW4 task a cycle named sw4_<event>, shown as one `sw4` column:
+    #   columns:
+    #     - match: 'sw4_.*'
+    #       column: sw4
+    columns: []
+    # The scheduler is `silent` once its `running` heartbeat is older than this many
+    # of its heartbeat intervals.
+    stale_intervals: 3

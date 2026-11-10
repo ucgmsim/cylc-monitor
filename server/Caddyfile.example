@@ -1,0 +1,20 @@
+# An example Caddy site for the monitor. Replace cylc.example.org with your hostname,
+# append it to /etc/caddy/Caddyfile, then:
+#   sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
+cylc.example.org {
+    reverse_proxy 127.0.0.1:8017
+    encode gzip zstd
+    header {
+        Strict-Transport-Security "max-age=31536000;"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+    log {
+        output file /var/log/caddy/cylc-monitor.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+}

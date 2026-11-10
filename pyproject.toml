@@ -1,0 +1,37 @@
+[project]
+name = "cylc-monitor"
+version = "0.1.0"
+description = "Cylc 8 event handlers that post a workflow's events and scheduler heartbeat to a Datasette, and a reader for it."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jake Faulkner" }]
+# The client runs on HPC login nodes: standard library only, old Pythons.
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+cylc-monitor-event = "cylc_monitor_event:run"
+cylc-monitor-heartbeat = "cylc_monitor_heartbeat:run"
+cylc-monitor-status = "cylc_monitor_status:run"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Three single-file modules, so each can also be copied into a workflow's bin/.
+only-include = ["client"]
+sources = ["client"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7",
+    # The server, for the end-to-end test (tests/test_server.py); it needs Python 3.10+.
+    "datasette==1.0a41; python_version >= '3.10'",
+    "datasette-auth-passwords==1.1.1; python_version >= '3.10'",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["client", "server", "server/plugins"]
+testpaths = ["tests"]
