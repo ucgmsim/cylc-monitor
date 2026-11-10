@@ -1,0 +1,13 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: ucgmsim/meta-ci-action/.github/workflows/ci.yml@v2
+    with:
+      uv-extra-args: "--all-groups --all-extras"
+      exclude-init: false

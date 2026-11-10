@@ -11,8 +11,9 @@ import shutil
 import sqlite3
 from pathlib import Path
 
-import cylc_monitor_upload as upload
 import pytest
+
+from cylc_monitor import upload
 
 RUN = Path(__file__).resolve().parent / "data" / "run"
 
@@ -51,7 +52,7 @@ def test_resources_from_the_header_only(tmp_path: Path) -> None:
     script = tmp_path / "job"
     script.write_text(
         "#!/bin/bash -l\n#SBATCH --job-name=sw4.1\n#SBATCH -n 820\n#SBATCH --mem-per-cpu=1900\n"
-        "#SBATCH --time 08:00:00\n#SBATCH -A nesi00213\n\necho\n#SBATCH --ntasks=1\n"
+        "#SBATCH --time 08:00:00\n#SBATCH -A abc12345\n\necho\n#SBATCH --ntasks=1\n"
     )
     r = upload.resources(script)
     assert (
@@ -60,23 +61,19 @@ def test_resources_from_the_header_only(tmp_path: Path) -> None:
         r["mem_mb"],
         r["time_limit_min"],
         r["account"],
-    ) == (820, 820, 820 * 1900, 480, "nesi00213")
+    ) == (820, 820, 820 * 1900, 480, "abc12345")
 
 
 def test_resources_memory_per_node(tmp_path: Path) -> None:
     script = tmp_path / "job"
-    script.write_text(
-        "#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=4\n#SBATCH --mem=8G\n"
-    )
+    script.write_text("#SBATCH --nodes=2\n#SBATCH --ntasks-per-node=4\n#SBATCH --mem=8G\n")
     r = upload.resources(script)
     assert (r["nodes"], r["mem_mb"], r["cores"]) == (2, 16384, None)
 
 
 def test_resources_none_for_a_background_job() -> None:
     r = upload.resources(RUN / "log" / "job" / "1" / "prep" / "01" / "job")
-    assert all(
-        r[k] is None for k in ("cores", "mem_mb", "time_limit_min", "directives")
-    )
+    assert all(r[k] is None for k in ("cores", "mem_mb", "time_limit_min", "directives"))
 
 
 def test_snapshot(tmp_path: Path) -> None:
@@ -85,10 +82,7 @@ def test_snapshot(tmp_path: Path) -> None:
     path = tmp_path / "snapshot.db"
     upload.Snapshot(run, "monlab/run2", 300).build(path, "stopped", "host", None)
     conn = sqlite3.connect(path)
-    tables = {
-        r[0]
-        for r in conn.execute("select name from sqlite_master where type = 'table'")
-    }
+    tables = {r[0] for r in conn.execute("select name from sqlite_master where type = 'table'")}
     assert {
         "task_jobs",
         "task_events",
@@ -96,45 +90,38 @@ def test_snapshot(tmp_path: Path) -> None:
         "job_resources",
         "job_logs",
     } <= tables
-    assert conn.execute(
-        "select workflow, status, interval_s from monitor"
-    ).fetchall() == [("monlab/run2", "stopped", 300)]
+    assert conn.execute("select workflow, status, interval_s from monitor").fetchall() == [
+        ("monlab/run2", "stopped", 300)
+    ]
     sim = conn.execute(
         "select cores, ntasks, cpus_per_task, mem_mb, time_limit_min, account from job_resources where name = 'sim'"
     )
     assert sim.fetchall() == [(8, 4, 2, 4000.0, 10.0, "test0001")] * 2
-    logs = conn.execute(
-        "select cycle, name, submit_num, job_err from job_logs order by cycle"
-    ).fetchall()
+    logs = conn.execute("select cycle, name, submit_num, job_err from job_logs order by cycle").fetchall()
     assert [row[:3] for row in logs] == [("1", "flaky", 1), ("2", "flaky", 1)]
     assert "flaky: first try fails" in logs[0][3]
     # The run's own database is untouched.
     assert "monitor" not in {
-        r[0]
-        for r in sqlite3.connect(run / "log" / "db").execute(
-            "select name from sqlite_master"
-        )
+        r[0] for r in sqlite3.connect(run / "log" / "db").execute("select name from sqlite_master")
     }
 
 
-def test_no_url_or_token_uploads_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_no_url_or_token_uploads_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CYLC_MONITOR_URL", raising=False)
+    monkeypatch.setattr(upload, "URL_FILE", str(tmp_path / "no-url"))
     calls = []
     monkeypatch.setattr(upload, "upload", lambda *a: calls.append(a))
-    upload.main(["--workflow", "w", "--run-dir", str(RUN), "--once"])
-    upload.main(
-        [
-            "--workflow",
-            "w",
-            "--run-dir",
-            str(RUN),
-            "--once",
-            "--url",
-            "http://x",
-            "--token-file",
-            str(tmp_path / "none"),
-        ]
-    )
+    assert upload.main(["--workflow", "w", "--run-dir", str(RUN)]) == 1
+    args = ["--workflow", "w", "--run-dir", str(RUN), "--url", "http://x", "--token-file", str(tmp_path / "none")]
+    assert upload.main(args) == 1
     assert calls == []
+
+
+def test_upload_by_hand(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    token = tmp_path / "token"
+    token.write_text("t")
+    calls = []
+    monkeypatch.setattr(upload, "upload", lambda *a: calls.append(a[:3]))
+    args = ["--workflow", "w", "--run-dir", str(RUN), "--url", "http://x", "--token-file", str(token)]
+    assert upload.main(args) == 0
+    assert calls == [("http://x", "t", "w")]

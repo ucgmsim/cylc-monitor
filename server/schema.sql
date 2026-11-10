@@ -57,11 +57,12 @@ SELECT workflow, cycle, name, submit_num, try_num, job_id, platform, state,
 FROM timed;
 
 -- One row a workflow: its scheduler, its jobs by state, what it has used.
--- health: the scheduler's last word (running, stopped, scheduler gone), or `silent` when a
--- running scheduler's last upload is older than three heartbeats.
+-- health: the scheduler's last word (running, paused, stalled, stopped), or `silent` when a
+-- scheduler not stopped hasn't uploaded for three heartbeats (it, its host or the network
+-- may be down). Active workflows are those not stopped.
 CREATE VIEW workflows AS
 SELECT m.workflow,
-       CASE WHEN m.status = 'running' AND (julianday('now') - julianday(m.uploaded_at)) * 86400 > 3 * m.interval_s
+       CASE WHEN m.status != 'stopped' AND (julianday('now') - julianday(m.uploaded_at)) * 86400 > 3 * m.interval_s
             THEN 'silent' ELSE m.status END AS health,
        m.uploaded_at, m.host,
        (SELECT value FROM workflow_params w WHERE w.workflow = m.workflow AND key = 'is_paused') AS is_paused,

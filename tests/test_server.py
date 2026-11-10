@@ -1,7 +1,7 @@
 """End to end: Datasette 1.0a41 with server/'s config and plugins on a temp database,
 uploaded to by the client and read with the reader token.
 
-Skipped unless datasette is importable (it is in the dev group: `uv run pytest`).
+
 """
 
 from __future__ import annotations
@@ -17,13 +17,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import make_token
 import pytest
 
-pytest.importorskip("datasette")
-
-import cylc_monitor_status as status
-import cylc_monitor_upload as upload
-import make_token
+from cylc_monitor import status, upload
 
 SERVER = Path(__file__).resolve().parent.parent / "server"
 RUN = Path(__file__).resolve().parent / "data" / "run"
@@ -36,14 +33,10 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def request(
-    url: str, token: str | None = None, data: bytes | None = None
-) -> tuple[int, bytes]:
+def request(url: str, token: str | None = None, data: bytes | None = None) -> tuple[int, bytes]:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     try:
-        with urllib.request.urlopen(
-            urllib.request.Request(url, data=data, headers=headers), timeout=10
-        ) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=10) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.read()
@@ -59,9 +52,7 @@ def token(kind: str) -> str:
         "--secret",
         SECRET,
     ]
-    return subprocess.run(
-        command, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    return subprocess.run(command, check=True, capture_output=True, text=True).stdout.strip()
 
 
 @pytest.fixture(scope="module")
@@ -87,6 +78,7 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
                 break
             except OSError:
                 if process.poll() is not None:
+                    assert process.stdout is not None
                     pytest.fail(process.stdout.read().decode())
                 time.sleep(0.1)
         yield {
@@ -124,12 +116,7 @@ def test_only_the_writer_may_upload(monitor: dict, tmp_path: Path) -> None:
     target = f"{monitor['url']}/-/cylc/upload?workflow=w/run1"
     assert request(target, None, body)[0] == 403
     assert request(target, monitor["reader"], body)[0] == 403
-    assert (
-        request(
-            f"{monitor['url']}/-/cylc/upload?workflow=../x", monitor["writer"], body
-        )[0]
-        == 400
-    )
+    assert request(f"{monitor['url']}/-/cylc/upload?workflow=../x", monitor["writer"], body)[0] == 400
     assert request(target, monitor["writer"], b"not sqlite")[0] == 400
     assert request(f"{monitor['url']}/-/dashboards/cylc")[0] == 403
 
@@ -142,9 +129,7 @@ def test_a_second_upload_replaces_the_first(monitor: dict, tmp_path: Path) -> No
             "w/run1",
             snapshot(tmp_path, "w/run1", state),
         )
-    upload.upload(
-        monitor["url"], monitor["writer"], "w/run2", snapshot(tmp_path, "w/run2")
-    )
+    upload.upload(monitor["url"], monitor["writer"], "w/run2", snapshot(tmp_path, "w/run2"))
     counts = sql(
         monitor,
         "select workflow, count(*) as n from task_jobs group by workflow order by workflow",
@@ -163,9 +148,7 @@ def test_a_second_upload_replaces_the_first(monitor: dict, tmp_path: Path) -> No
 
 
 def test_jobs_view(monitor: dict, tmp_path: Path) -> None:
-    upload.upload(
-        monitor["url"], monitor["writer"], "w/run2", snapshot(tmp_path, "w/run2")
-    )
+    upload.upload(monitor["url"], monitor["writer"], "w/run2", snapshot(tmp_path, "w/run2"))
     sim = sql(
         monitor,
         "select * from jobs where workflow = 'w/run2' and name = 'sim' and cycle = '1'",
@@ -178,9 +161,7 @@ def test_jobs_view(monitor: dict, tmp_path: Path) -> None:
         sim["queue_s"],
     ) == ("succeeded", 8, 3.91, "test0001", 10)
     assert sim["core_hours"] == pytest.approx(8 * sim["run_s"] / 3600, abs=0.01)
-    assert (
-        sim["max_rss_gb"] > 0 and sim["cpu_hours"] > 0
-    )  # Cylc's profiler was on for this run
+    assert sim["max_rss_gb"] > 0 and sim["cpu_hours"] > 0  # Cylc's profiler was on for this run
     flaky = sql(
         monitor,
         "select submit_num, state, job_err from jobs where workflow = 'w/run2' and name = 'flaky' and cycle = '1' order by submit_num",
@@ -195,18 +176,16 @@ def test_jobs_view(monitor: dict, tmp_path: Path) -> None:
 def test_dashboard_queries_run(monitor: dict) -> None:
     import yaml
 
-    charts = yaml.safe_load((SERVER / "datasette.yaml").read_text())["plugins"][
-        "datasette-dashboards"
-    ]["cylc"]["charts"]
+    charts = yaml.safe_load((SERVER / "datasette.yaml").read_text())["plugins"]["datasette-dashboards"]["cylc"][
+        "charts"
+    ]
     for chart in charts.values():
         query = chart["query"].replace("[[", "/*").replace("]]", "*/")
         sql(monitor, query)  # asserts 200
     assert request(f"{monitor['url']}/-/dashboards/cylc", monitor["reader"])[0] == 200
 
 
-def test_status_ignores_a_retry_that_succeeded(
-    monitor: dict, tmp_path: Path, capsys: pytest.CaptureFixture
-) -> None:
+def test_status_ignores_a_retry_that_succeeded(monitor: dict, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     token_file = tmp_path / "reader"
     token_file.write_text(monitor["reader"])
     assert status.main(["--url", monitor["url"], "--token-file", str(token_file)]) == 0

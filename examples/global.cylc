@@ -1,0 +1,24 @@
+# An example ~/.cylc/flow/global.cylc for the cylc-monitor plugin, on a Slurm cluster.
+# Merge these sections into your own global.cylc; `cylc config` shows the result.
+
+[scheduler]
+    [[main loop]]
+        # Run the plugin in every workflow's scheduler. Leave this out, and set it
+        # in one workflow's flow.cylc instead, to monitor only that workflow.
+        plugins = cylc monitor
+        [[[cylc monitor]]]
+            # How often the scheduler calls the plugin. The plugin uploads only when
+            # the workflow's database or state has changed, and at least every 5
+            # minutes otherwise. Cylc's default for a plugin is PT10M.
+            interval = PT30S
+
+[platforms]
+    # Your Slurm platform, as it already is, with Cylc's job profiler turned on
+    # (Cylc 8.7 or later). The profiler records each job's peak memory and CPU time,
+    # which the monitor shows against what the job asked for. Leave it out and the
+    # monitor still shows each job's state, times, cores, memory and core-hours.
+    [[my-slurm-platform]]
+        [[[profiler]]]
+            activate = True
+            # Where cgroups are mounted on the compute nodes (Cylc's default).
+            # cgroups path = /sys/fs/cgroup

@@ -1,62 +1,135 @@
 # cylc-monitor
 
-Follow a Cylc 8 workflow from outside the cluster. A small daemon on the scheduler host
-uploads the workflow's own database (`log/db`) to a [Datasette](https://datasette.io)
-whenever it changes. The Datasette merges every workflow's uploads into one database,
-with a dashboard of the jobs queued, running and finished: what each asked for, what
-it used, and core-hours and RSUs. Anyone with a read token can follow the run there
-without logging in to the cluster.
+Follow a Cylc 8 workflow from outside the cluster. A Cylc main-loop plugin, running inside
+the scheduler, uploads the workflow's own database (`log/db`) to a
+[Datasette](https://datasette.io) whenever it changes. The Datasette merges every
+workflow's uploads into one database, with a dashboard of the jobs queued, running and
+finished: what each asked for, what it used, and its core-hours and RSUs. Anyone with a
+read token can follow the run there without logging in to the cluster.
 
 ## Why
 
 On REANNZ (NeSI), the AI-agent rules allow an agent on the cluster only while a person
 supervises it live. So an agent such as Claude Code may not log in to check on a
-long-running workflow. The workflow can still report its own state. Cylc already
-records everything about its jobs in its public database, so the workflow only has to
-send a copy of that out to a server you control. The agent then reads that server with
-a token that can only read. There are no push alerts: you look at the dashboard, or
-run `cylc-monitor-status`.
+long-running workflow. The workflow can still report its own state. Cylc already records
+everything about its jobs in its public database, so the scheduler only has to send a
+copy of that out to a server you control. The agent then reads that server with a token
+that can only read. There are no push alerts: you look at the dashboard, or run
+`cylc-monitor-status`.
 
 Nothing here is specific to REANNZ or to one workflow.
 
 ## How it fits together
 
 ```
-scheduler host (cluster)                         server (e.g. a VPS; reverse proxy -> 127.0.0.1:8017)
-  cylc_monitor_upload.py --daemon                  Datasette, cylc.db
-    every 30 s: has log/db changed?   --- POST -->   /-/cylc/upload   merge the snapshot   (plugins/cylc_upload.py)
-    if so, or 5 min since the last:   snapshot       task_jobs, task_events, ... + workflow column (tables)
-    snapshot it and upload (gzip)                    jobs, workflows                               (views, schema.sql)
-                                                     /-/dashboards/cylc                            (datasette-dashboards)
+scheduler (cluster)                              server (e.g. a VPS; reverse proxy -> 127.0.0.1:8017)
+  `cylc monitor` main-loop plugin                  Datasette, cylc.db
+    every 30 s: has log/db or the       -- POST -->  /-/cylc/upload   merge the snapshot   (server/plugins/cylc_upload.py)
+    scheduler's state changed? If so,   snapshot     task_jobs, task_events, ... + workflow column (tables)
+    or 5 min since the last: snapshot   (gzip)       jobs, workflows                               (views, server/schema.sql)
+    it and upload, in a thread                       /-/dashboards/cylc                            (datasette-dashboards)
                                                           ^
-  anywhere: cylc_monitor_status.py, a browser  -----------+  (read only)
+  anywhere: cylc-monitor-status, a browser  --------------+  (read only)
 ```
 
-- `client/`: two single-file Python scripts that use only the standard library and run
-  on Python 3.8 or later. Copy them into a workflow's `bin/`, or install the package.
-  - `cylc_monitor_upload.py` (`cylc-monitor-upload`), started by the startup handler.
-  - `cylc_monitor_status.py` (`cylc-monitor-status`), the reader. It prints each active
+- `cylc_monitor/`: the Python package, on PyPI as `cylc-monitor`. It uses only the
+  standard library, plus Cylc's own API for the plugin.
+  - `mainloop.py`: the `cylc monitor` main-loop plugin.
+  - `upload.py`: the snapshot and upload. Also the command `cylc-monitor-upload`, which
+    uploads one snapshot by hand.
+  - `status.py`: the command `cylc-monitor-status`, the reader. It prints each active
     workflow's state and exits 1 if something needs a person.
 - `server/`: the Datasette side, run with Docker Compose. It has the views
   (`schema.sql`), the permissions and dashboard (`datasette.yaml`), the upload plugin,
   a token maker and an example Caddy site.
+- `examples/global.cylc`: the Cylc configuration that turns the plugin on.
 
-Datasette is pinned to 1.0a41 (its tokens and write API), datasette-auth-passwords to
-1.1.1 and datasette-dashboards to 0.8.0. datasette-dashboards 0.8.0 still calls an API
-that Datasette 1.0 removed, so `plugins/permission_compat.py` maps it onto the new one.
+Datasette is pinned to 1.0a41 (for its tokens), datasette-auth-passwords to 1.1.1 and
+datasette-dashboards to 0.8.0. datasette-dashboards 0.8.0 still calls an API that
+Datasette 1.0 removed, so `server/plugins/permission_compat.py` maps it onto the new one.
+
+## Installing the plugin
+
+The plugin runs inside the scheduler, so it must be installed into the Python
+environment Cylc runs from. Cylc finds main-loop plugins through Python entry points:
+putting it on `PYTHONPATH` doesn't work. It needs Cylc 8.7 or later, on Python 3.12 or
+later.
+
+1. **Install it beside Cylc.** If you installed Cylc with uv, reinstall it with the
+   plugin:
+   ```sh
+   uv tool install cylc-flow==8.7.0 --with cylc-monitor
+   ```
+   Keep the Cylc version you already run. With pip, in Cylc's own environment:
+   `pip install cylc-monitor`. Either way, check that Cylc can see the plugin:
+   ```sh
+   "$(dirname "$(readlink -f "$(command -v cylc)")")/python" -c \
+       "from importlib.metadata import entry_points; print(entry_points(group='cylc.main_loop')['cylc_monitor'])"
+   ```
+   If Cylc is a shared install you can't change, such as a site module, ask its
+   maintainers. You can also run your own Cylc with uv, as above.
+2. **Tell it where the monitor is.** Write the server's URL, and the writer token from
+   the server (see [Deploying the server](#deploying-the-server)), on the scheduler
+   host:
+   ```sh
+   mkdir -p ~/.config/cylc-monitor && chmod 700 ~/.config/cylc-monitor
+   echo https://cylc.example.org > ~/.config/cylc-monitor/url
+   # the token: see step 5 of Deploying the server
+   chmod 600 ~/.config/cylc-monitor/token
+   ```
+   `CYLC_MONITOR_URL` and `CYLC_MONITOR_TOKEN_FILE`, set where the scheduler starts,
+   override the two files.
+3. **Turn it on** in `~/.cylc/flow/global.cylc`, as in
+   [`examples/global.cylc`](examples/global.cylc):
+   ```ini
+   [scheduler]
+       [[main loop]]
+           plugins = cylc monitor
+           [[[cylc monitor]]]
+               interval = PT30S
+   ```
+   Every workflow started after this uploads. To monitor only some workflows, put the
+   same `[scheduler][[main loop]]` section in their `flow.cylc` instead. A workflow
+   that lists the plugin won't start where the plugin isn't installed, so the
+   `global.cylc` route keeps a workflow's `flow.cylc` portable. `cylc config -i
+   '[scheduler][main loop]'` shows what Cylc reads.
+4. **Optionally, turn on Cylc's job profiler** for your Slurm platform (see
+   [What each job used](#what-each-job-used-cylcs-profiler)).
+
+A scheduler already running before this picks the plugin up when it restarts.
+`cylc stop --now` leaves the jobs running, and `cylc play` restarts the scheduler.
+Or upload once by hand: `cylc-monitor-upload --workflow my-flow/run1 --run-dir
+~/cylc-run/my-flow/run1`.
+
+The scheduler's log says `[cylc monitor] uploading to <url>` at startup. Without a URL
+or token it logs a warning instead and uploads nothing; the workflow runs as before. A
+failed upload is logged and retried at the next check.
 
 ## The upload
 
-The daemon looks at `log/db`'s modification time every `--check` seconds (30). When it
-has changed, or `--heartbeat` seconds (300) have passed, it builds a snapshot and posts
-it to `/-/cylc/upload?workflow=<id>`. The snapshot is a consistent copy of `log/db`,
-made with SQLite's backup API on a read-only connection, plus three tables:
+Every `interval`, the scheduler calls the plugin. The plugin uploads in these cases:
+- `log/db`'s modification time has changed;
+- the scheduler has gone between running, paused and stalled;
+- 5 minutes have passed since the last upload.
 
-- `monitor`: the scheduler's state from its contact file (`running`, `stopped` or
-  `scheduler gone`), host, PID, the upload time and the heartbeat interval.
+The plugin builds the snapshot and posts it to `/-/cylc/upload?workflow=<id>` in a
+thread, so the scheduler never waits on the network. If an upload is still going at the
+next check, that check is skipped.
+
+At a clean shutdown it uploads once more, marked `stopped`. A crash or kill sends
+nothing. The dashboard then shows the workflow as `silent` once three heartbeats (15
+min) pass without an upload.
+
+The snapshot is a consistent copy of `log/db`, made with SQLite's backup API on a
+read-only connection, plus three tables:
+
+- `monitor`: the scheduler's state (`running`, `paused`, `stalled` or `stopped`),
+  host, PID, the upload time and the heartbeat interval.
 - `job_resources`: each job's `#SBATCH` directives, read from its job script
-  (`log/job/<cycle>/<task>/<NN>/job`): cores (ntasks × cpus-per-task), nodes (the
-  minimum, for a range), memory, time limit, account and partition.
+  (`log/job/<cycle>/<task>/<NN>/job`). That covers:
+  - cores (ntasks × cpus-per-task);
+  - nodes (the minimum, for a range);
+  - memory, time limit, account and partition.
 - `job_logs`: the last 20 lines of `job.err` for each failed job.
 
 The server merges the snapshot into its own `cylc` database in one transaction. Each
@@ -66,20 +139,19 @@ new. An upload is idempotent, a lost one is repaired by the next, and every work
 can be queried together.
 
 [datasette-upload-dbs](https://datasette.io/plugins/datasette-upload-dbs) looks like
-it does this job, but it doesn't. It fails on Datasette 1.0. On 0.65 a second upload of
-the same name truncates the live file in place and registers it as a second database,
-`<name>_2`.
-
-The daemon stops after the upload that sees the scheduler stopped or gone. It logs to
-`log/cylc-monitor-upload.log` in the run directory and keeps its PID in
-`log/cylc-monitor-upload.pid`. Only one runs per run directory.
+it would do this job, but it doesn't. It fails on Datasette 1.0. On 0.65 a second upload
+of the same name truncates the live file in place and registers it as a second
+database, `<name>_2`.
 
 ### What it costs the cluster
 
-A `stat` of one file every 30 s. When the file has changed: a copy of a database of a
-few hundred KB (200 KB for a 19-job workflow), a read of each new job script's header,
-and one HTTPS POST of the gzipped snapshot. It makes no Slurm calls: what a job asked
-for comes from its job script, and what it used from Cylc's profiler.
+A `stat` of one file every 30 s, from inside the scheduler. When the file has changed:
+- a copy of a database of a few hundred KB (200 KB for a 19-job workflow);
+- a read of each new job script's header;
+- one HTTPS POST of the gzipped snapshot.
+
+It makes no Slurm calls. What a job asked for comes from its job script, and what it
+used from Cylc's profiler.
 
 ## What each job used: Cylc's profiler
 
@@ -87,13 +159,13 @@ Cylc 8.7 has a job profiler. Turn it on per platform in `global.cylc`:
 
 ```ini
 [platforms]
-    [[mahuika]]
+    [[my-slurm-platform]]
         [[[profiler]]]
             activate = True
 ```
 
 Each job then runs `cylc profile` beside its script. The profiler reads the job's
-cgroup every 10 s and, at the end, sends the scheduler
+cgroup every 10 s. At the end it sends the scheduler
 `_cylc_profiler: {"max_rss": bytes, "cpu_time": ms, "memory_allocated": bytes}`. Cylc
 stores that in `task_events`, and the `jobs` view turns it into `max_rss_gb`,
 `cpu_hours` and `mem_allocated_gb`. Some limits:
@@ -107,18 +179,22 @@ stores that in `task_events`, and the `jobs` view turns it into `max_rss_gb`,
 
 ## The views and the dashboard
 
-- `jobs`: one row a job (a task's submission). It has the state (`submitting`,
-  `submitted`, `running`, `succeeded`, `failed`, `submit-failed`), time queued and
-  running, what it asked for and the profiler's figures. It also has
-  `core_hours` = cores × hours running and `rsu` = (1.4 × cores + 0.20 × GB requested)
-  × hours, REANNZ's rates. A job's time so far stops at its workflow's last upload.
+- `jobs`: one row a job (a task's submission). It has:
+  - the state: `submitting`, `submitted`, `running`, `succeeded`, `failed` or
+    `submit-failed`;
+  - time queued and time running;
+  - what it asked for, and the profiler's figures;
+  - `core_hours` = cores × hours running;
+  - `rsu` = (1.4 × cores + 0.20 × GB requested) × hours, REANNZ's rates.
+
+  A job's time so far stops at its workflow's last upload.
 - `workflows`: one row a workflow. `health` is the scheduler's last state, or `silent`
-  when a `running` scheduler hasn't uploaded for three heartbeats. It also counts the
+  when a scheduler not stopped hasn't uploaded for three heartbeats. It also counts the
   jobs by state and totals core-hours and RSUs.
 
 `/-/dashboards/cylc` shows:
-- for active workflows (`running` or `silent`): jobs running, queued and failed, and
-  core-hours and RSUs;
+- for active workflows (not stopped): jobs running, queued and failed, and core-hours
+  and RSUs;
 - the workflows;
 - the submitted and running jobs;
 - the latest finished jobs, asked for against used;
@@ -134,22 +210,22 @@ Datasette lets in no anonymous visitors. There are three actors:
 | Actor | How | May |
 |---|---|---|
 | `admin` | a browser, at `/-/login` (password hash in `.env`) | read everything |
-| `cylc-writer` | a token on the scheduler host, `~/.config/cylc-monitor/token` | upload snapshots; the plugin checks the actor's id, and the token may otherwise only view the instance |
+| `cylc-writer` | a token on the scheduler host, `~/.config/cylc-monitor/token` | upload snapshots; the upload plugin checks the actor's id, and the token may otherwise only view the instance |
 | `cylc-reader` | a token wherever you read from, `~/.config/cylc-monitor/reader-token` | read tables and views, run read-only SQL, see the dashboard |
 
-Tokens are signed with `DATASETTE_SECRET` and don't expire. Changing the secret
-revokes every token.
+Tokens are signed with `DATASETTE_SECRET` and don't expire. Changing the secret revokes
+every token.
 
 ## What leaves the cluster
 
-- the workflow's public database (`log/db`): task names, cycle points, job IDs and
-  times, task outputs and messages, and workflow parameters;
-- the `#SBATCH` lines of each job script;
-- the last 20 lines of `job.err` of each failed job;
-- the scheduler host's name and the scheduler's PID.
+- The workflow's public database (`log/db`). That holds task names, cycle points, job
+  IDs and times, task outputs and messages, and workflow parameters.
+- The `#SBATCH` lines of each job script.
+- The last 20 lines of `job.err` of each failed job.
+- The scheduler host's name and the scheduler's PID.
 
 If a task's messages or `job.err` may hold something that must not leave the cluster,
-don't run the uploader for that workflow.
+don't run the plugin for that workflow.
 
 ## Deploying the server
 
@@ -190,33 +266,10 @@ These steps assume a host with Docker Compose and a reverse proxy that handles T
 To update the server, copy the changed files over and run
 `sudo docker compose up -d --build` again. The views are remade at startup.
 
-## Wiring it into a workflow
-
-Copy `client/cylc_monitor_upload.py` into the workflow's `bin/` and start it from the
-startup handler:
-
-```ini
-[scheduler]
-    [[events]]
-        startup handlers = python3 "$CYLC_WORKFLOW_RUN_DIR/bin/cylc_monitor_upload.py" --daemon --url https://cylc.example.org --workflow %(workflow)s
-```
-
-That is the only handler. A restart starts the daemon again: the startup event fires
-then too. The daemon reads the writer token from `~/.config/cylc-monitor/token`, or
-from `--token-file` or `CYLC_MONITOR_TOKEN_FILE`. Without a URL or a token it uploads
-nothing, and the workflow runs as before. An upload that fails is logged and retried
-at the next check.
-
-To start it by hand for a workflow already running (it doesn't need the scheduler):
-
-```sh
-python3 cylc_monitor_upload.py --daemon --url https://cylc.example.org \
-    --workflow my-flow/run1 --run-dir ~/cylc-run/my-flow/run1
-```
-
-`--once` uploads one snapshot and exits.
-
 ## Reading it
+
+Install the reader anywhere with `uv tool install cylc-monitor` (or `uvx --from
+cylc-monitor cylc-monitor-status`), then:
 
 ```sh
 cylc-monitor-status --url https://cylc.example.org            # active workflows
@@ -224,25 +277,36 @@ cylc-monitor-status my-flow/run1 --url https://cylc.example.org
 cylc-monitor-status --all --url https://cylc.example.org      # stopped ones too
 ```
 
-Set `CYLC_MONITOR_URL` to drop `--url`. The reader token comes from
-`~/.config/cylc-monitor/reader-token`, `--token-file`, or
-`CYLC_MONITOR_READER_TOKEN_FILE`. Datasette's own JSON and SQL work with the same
-token, for example
-`curl -H "Authorization: Bearer $(cat ~/.config/cylc-monitor/reader-token)" 'https://cylc.example.org/cylc.json?sql=select+*+from+workflows&_shape=array'`.
+Instead of `--url`, set `CYLC_MONITOR_URL` or write `~/.config/cylc-monitor/url`. The
+reader token comes from one of:
+- `~/.config/cylc-monitor/reader-token`;
+- `--token-file`;
+- `CYLC_MONITOR_READER_TOKEN_FILE`.
+
+Datasette's own JSON and SQL work with the same token, for example:
+```sh
+curl -H "Authorization: Bearer $(cat ~/.config/cylc-monitor/reader-token)" 'https://cylc.example.org/cylc.json?sql=select+*+from+workflows&_shape=array'
+```
 
 ## Development
 
 ```sh
+uv sync --all-groups --all-extras
 uv run pytest
+uv run ruff check . && uv run ruff format --check . && uv run deptry . && uv run ty check
 ```
 
-`tests/data/run` is a real Cylc 8.7.0 run directory, its `log/db` and job scripts.
-The run had the profiler on and a stand-in Slurm. `tests/test_server.py` starts the
-server on a temporary database and checks:
-- the permissions;
-- that a re-upload replaces rather than adds;
-- the `jobs` view;
-- that every dashboard query runs;
-- the status client.
+CI runs the same checks, plus numpydoc linting, through
+[ucgmsim/meta-ci-action](https://github.com/ucgmsim/meta-ci-action). Publishing a GitHub
+release builds the package and publishes it to PyPI (`.github/workflows/publish-PyPI.yml`).
+The version comes from the release's tag (setuptools-scm).
 
-It is skipped when Datasette can't be imported, which means on Python < 3.10.
+`tests/data/run` is a real Cylc 8.7.0 run directory, its `log/db` and job scripts.
+The run had the profiler on and a stand-in Slurm. The tests cover:
+- `tests/test_mainloop.py`: the plugin, driven as the scheduler drives it.
+- `tests/test_server.py`: it starts the server on a temporary database and checks:
+  - the permissions;
+  - that a re-upload replaces rather than adds;
+  - the `jobs` view;
+  - that every dashboard query runs;
+  - the status reader.

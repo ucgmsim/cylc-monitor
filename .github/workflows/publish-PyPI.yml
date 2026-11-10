@@ -1,0 +1,36 @@
+name: Publish to PyPI
+run-name: Publish Python Package to PyPI for release ${{ github.event.release.tag_name || inputs.tag_name || github.ref_name }}
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Git tag to checkout and publish"
+        required: false
+        type: string
+
+jobs:
+  # A pure-Python package: one py3-none-any wheel and the sdist. See
+  # ucgmsim/meta-ci-action's README.
+  build:
+    uses: ucgmsim/meta-ci-action/.github/workflows/build-dist.yml@v2.3
+    with:
+      ref: ${{ inputs.tag_name }} # empty on a release: builds the release tag
+
+  publish-to-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/cylc-monitor
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@v1.13.0

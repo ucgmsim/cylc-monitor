@@ -24,6 +24,7 @@ TOKENS = {
 
 
 def main() -> None:
+    """Print the token named on the command line (writer or reader)."""
     if len(sys.argv) != 2 or sys.argv[1] not in TOKENS:
         sys.exit(__doc__)
     secret = os.environ["DATASETTE_SECRET"]

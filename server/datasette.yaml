@@ -12,7 +12,7 @@ plugins:
   datasette-auth-passwords:
     admin_password_hash:
       $env: ADMIN_PASSWORD_HASH
-  # /-/dashboards/cylc. Active workflows: those whose scheduler is running (or silent).
+  # /-/dashboards/cylc. Active workflows: those not stopped (running, paused, stalled or silent).
   datasette-dashboards:
     cylc:
       title: Cylc workflows
@@ -37,7 +37,7 @@ plugins:
           display: {field: n}
           query: >
             SELECT count(*) AS n FROM jobs JOIN workflows USING (workflow)
-            WHERE state = 'running' AND health IN ('running', 'silent') [[ AND workflow = :workflow ]]
+            WHERE state = 'running' AND health != 'stopped' [[ AND workflow = :workflow ]]
         queued:
           title: Jobs queued
           db: cylc
@@ -45,7 +45,7 @@ plugins:
           display: {field: n}
           query: >
             SELECT count(*) AS n FROM jobs JOIN workflows USING (workflow)
-            WHERE state IN ('submitting', 'submitted') AND health IN ('running', 'silent') [[ AND workflow = :workflow ]]
+            WHERE state IN ('submitting', 'submitted') AND health != 'stopped' [[ AND workflow = :workflow ]]
         failed:
           title: Failed jobs (retries included)
           db: cylc
@@ -53,7 +53,7 @@ plugins:
           display: {field: n}
           query: >
             SELECT count(*) AS n FROM jobs JOIN workflows USING (workflow)
-            WHERE state IN ('failed', 'submit-failed') AND health IN ('running', 'silent') [[ AND workflow = :workflow ]]
+            WHERE state IN ('failed', 'submit-failed') AND health != 'stopped' [[ AND workflow = :workflow ]]
         core-hours:
           title: Core-hours, active workflows
           db: cylc
@@ -61,7 +61,7 @@ plugins:
           display: {field: n}
           query: >
             SELECT round(coalesce(sum(core_hours), 0), 1) AS n FROM workflows
-            WHERE health IN ('running', 'silent') [[ AND workflow = :workflow ]]
+            WHERE health != 'stopped' [[ AND workflow = :workflow ]]
         rsu:
           title: RSUs, active workflows
           db: cylc
@@ -69,7 +69,7 @@ plugins:
           display: {field: n}
           query: >
             SELECT round(coalesce(sum(rsu), 0), 1) AS n FROM workflows
-            WHERE health IN ('running', 'silent') [[ AND workflow = :workflow ]]
+            WHERE health != 'stopped' [[ AND workflow = :workflow ]]
         workflows:
           title: Workflows
           db: cylc
@@ -83,7 +83,7 @@ plugins:
             SELECT j.workflow, j.cycle, j.name, j.try_num, j.job_id, j.state, j.time_submit, j.time_run,
                    j.queue_s, j.run_s, j.cores, j.mem_gb, j.time_limit_min, j.core_hours, j.rsu
             FROM jobs j JOIN workflows w USING (workflow)
-            WHERE j.state IN ('submitting', 'submitted', 'running') AND w.health IN ('running', 'silent')
+            WHERE j.state IN ('submitting', 'submitted', 'running') AND w.health != 'stopped'
               [[ AND j.workflow = :workflow ]]
             ORDER BY j.state DESC, j.time_submit
         by-task:
