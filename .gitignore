@@ -1,4 +1,5 @@
-data/
+/server/data/
+/data/
 .env
 *.token
 __pycache__/
