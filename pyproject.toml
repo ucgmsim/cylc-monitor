@@ -1,37 +1,121 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "cylc-monitor"
-version = "0.1.0"
-description = "Cylc 8 event handlers that post a workflow's events and scheduler heartbeat to a Datasette, and a reader for it."
+description = "A Cylc 8 main-loop plugin that uploads a workflow's own database to a Datasette, with a jobs dashboard and a reader."
+authors = [{ name = "ucgmsim" }]
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Jake Faulkner" }]
-# The client runs on HPC login nodes: standard library only, old Pythons.
-requires-python = ">=3.8"
+# Cylc 8.7, whose scheduler the plugin runs in, needs 3.12.
+requires-python = ">=3.12"
+dynamic = ["version"]
+# The plugin and reader use only the standard library, plus Cylc's own API for the
+# plugin: installed into the Python environment Cylc runs from, which has it already.
 dependencies = []
 
+[project.optional-dependencies]
+cylc = ["cylc-flow>=8.7"]
+
+[project.urls]
+Repository = "https://github.com/ucgmsim/cylc-monitor"
+
 [project.scripts]
-cylc-monitor-event = "cylc_monitor_event:run"
-cylc-monitor-heartbeat = "cylc_monitor_heartbeat:run"
-cylc-monitor-status = "cylc_monitor_status:run"
+cylc-monitor-upload = "cylc_monitor.upload:run"
+cylc-monitor-status = "cylc_monitor.status:run"
 
-[build-system]
-requires = ["hatchling>=1.27"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-# Three single-file modules, so each can also be copied into a workflow's bin/.
-only-include = ["client"]
-sources = ["client"]
+[project.entry-points."cylc.main_loop"]
+# Turned on in global.cylc as `plugins = cylc monitor` (Cylc maps the space to `_`).
+cylc_monitor = "cylc_monitor.mainloop"
 
 [dependency-groups]
-dev = [
-    "pytest>=7",
-    # The server, for the end-to-end test (tests/test_server.py); it needs Python 3.10+.
-    "datasette==1.0a41; python_version >= '3.10'",
-    "datasette-auth-passwords==1.1.1; python_version >= '3.10'",
+test = [
+  "pytest",
+  "pyyaml",
+  # The scheduler side, for tests/test_mainloop.py.
+  "cylc-flow==8.7.0",
+  # The server, for the end-to-end test (tests/test_server.py): as server/Dockerfile pins it.
+  "datasette==1.0a41",
+  "datasette-auth-passwords==1.1.1",
+  "datasette-dashboards==0.8.0",
 ]
+dev = ["ruff", "deptry", "ty"]
+
+[tool.setuptools_scm]
+
+[tool.setuptools.packages.find]
+include = ["cylc_monitor"]
 
 [tool.pytest.ini_options]
-pythonpath = ["client", "server", "server/plugins"]
+pythonpath = ["server", "server/plugins"]
 testpaths = ["tests"]
+
+[tool.deptry]
+# server/ is deployed on its own, with its own pins (server/Dockerfile).
+extend_exclude = ["server"]
+
+[tool.deptry.package_module_name_map]
+cylc-flow = "cylc"
+
+[tool.ty.environment]
+extra-paths = ["server", "server/plugins"]
+
+[tool.ruff.lint]
+extend-select = [
+  # isort imports
+  "I",
+  # Use r'\s+' rather than '\s+'
+  "W605",
+  # All the naming errors, like using camel case for function names.
+  "N",
+  # Missing docstrings in classes, methods, and functions
+  "D101",
+  "D102",
+  "D103",
+  "D105",
+  "D107",
+  # Use f-string instead of a format call
+  "UP032",
+  # Standard library import is deprecated
+  "UP035",
+  # Missing function argument type-annotation
+  "ANN001",
+  # Using except without specifying an exception type to catch
+  "BLE001",
+]
+ignore = ["D104"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+# Ignore docstring errors in tests folder
+"tests/**.py" = ["D", "ANN001"]
+
+[tool.npdlint]
+include = ["cylc_monitor"]
+extend-exclude = ["**/__init__.py"]
+
+[tool.numpydoc_validation]
+checks = [
+  "GL05",
+  "GL08",
+  "GL10",
+  "PR01",
+  "PR02",
+  "PR03",
+  "PR04",
+  "PR05",
+  "PR06",
+  "PR07",
+  "RT01",
+  "RT02",
+  "RT03",
+  "RT04",
+  "YD01",
+]
+
+[tool.ruff]
+line-length = 120

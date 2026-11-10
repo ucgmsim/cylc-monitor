@@ -1,55 +1,74 @@
--- The monitor's database: Cylc workflow events and scheduler heartbeats, posted
--- from the scheduler host by cylc_monitor_event.py and cylc_monitor_heartbeat.py.
-PRAGMA journal_mode = WAL;
+-- The monitor's views, over the tables merged from each workflow's uploads (plugins/cylc_upload.py
+-- runs this after every merge). The tables are Cylc's own (task_jobs, task_states, task_pool,
+-- task_events, workflow_params) and the uploader's (monitor, job_resources, job_logs), each
+-- with a `workflow` column. Statements are separated by ";" at the end of a line.
+--
+-- A job's time so far stops at its workflow's last upload: the snapshot can't know more.
+-- RSUs are REANNZ's rates: 1.4 a core-hour plus 0.20 a GB-hour of memory requested.
 
--- One row a Cylc event: task events (submitted, started, succeeded, failed,
--- retry, ...) and workflow events (startup, shutdown, stall, abort).
-CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY,
-    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    sent_at TEXT,          -- the scheduler host's clock, UTC
-    workflow TEXT NOT NULL,
-    cycle TEXT,            -- task events only
-    task TEXT,
-    label TEXT,            -- what the cycle is, if the workflow says (--label, --labels)
-    event TEXT NOT NULL,
-    try_num INTEGER,
-    submit_num INTEGER,
-    job_id TEXT,           -- the batch system's (e.g. Slurm's)
-    log_tail TEXT,         -- the end of job.err, for failures and retries
-    message TEXT
-);
-CREATE INDEX IF NOT EXISTS events_workflow_task ON events (workflow, cycle, task, id);
-CREATE INDEX IF NOT EXISTS events_received ON events (received_at);
+DROP VIEW IF EXISTS workflows;
+DROP VIEW IF EXISTS jobs;
 
--- One row a workflow: the latest heartbeat from its scheduler host.
-CREATE TABLE IF NOT EXISTS heartbeats (
-    workflow TEXT PRIMARY KEY,
-    seen_at TEXT NOT NULL, -- the scheduler host's clock, UTC
-    status TEXT NOT NULL,  -- running, stopped, scheduler gone
-    host TEXT,
-    pid INTEGER,
-    interval_s INTEGER     -- how often it posts while running
-);
+-- One row a job (a task's submission): its state, what it asked for, what it used.
+-- Asked for: the job script's #SBATCH directives (job_resources). Used: Cylc's job profiler
+-- (task_events, when the platform activates it), which reads the cgroup of the node the
+-- batch script runs on, so for a multi-node job max_rss_gb and cpu_hours cover the first
+-- node only, and cpu_efficiency is given only for jobs that asked for --nodes=1.
+CREATE VIEW jobs AS
+WITH profile AS (
+    SELECT workflow, cycle, name, submit_num,
+           json_extract(substr(message, length('_cylc_profiler: ') + 1), '$.max_rss') AS max_rss,
+           json_extract(substr(message, length('_cylc_profiler: ') + 1), '$.cpu_time') AS cpu_time_ms,
+           json_extract(substr(message, length('_cylc_profiler: ') + 1), '$.memory_allocated') AS memory_allocated
+    FROM task_events
+    WHERE message LIKE '\_cylc\_profiler: %' ESCAPE '\'
+), timed AS (
+    SELECT j.workflow, j.cycle, j.name, j.submit_num, j.try_num, j.job_id, j.platform_name AS platform,
+           CASE
+               WHEN j.submit_status > 0 THEN 'submit-failed'
+               WHEN j.submit_status IS NULL THEN 'submitting'
+               WHEN j.run_status = 0 THEN 'succeeded'
+               WHEN j.run_status IS NOT NULL THEN 'failed'
+               WHEN j.time_run IS NOT NULL THEN 'running'
+               ELSE 'submitted'
+           END AS state,
+           j.time_submit, j.time_run, j.time_run_exit,
+           round((julianday(coalesce(j.time_run, CASE WHEN j.run_status IS NULL THEN m.uploaded_at END))
+                  - julianday(j.time_submit_exit)) * 86400) AS queue_s,
+           round((julianday(coalesce(j.time_run_exit, m.uploaded_at)) - julianday(j.time_run)) * 86400) AS run_s,
+           r.cores, r.nodes, round(r.mem_mb / 1024.0, 2) AS mem_gb, r.time_limit_min, r.account, r.partition,
+           p.max_rss, p.cpu_time_ms, p.memory_allocated, l.job_err
+    FROM task_jobs j
+    JOIN monitor m ON m.workflow = j.workflow
+    LEFT JOIN job_resources r USING (workflow, cycle, name, submit_num)
+    LEFT JOIN profile p USING (workflow, cycle, name, submit_num)
+    LEFT JOIN job_logs l USING (workflow, cycle, name, submit_num)
+)
+SELECT workflow, cycle, name, submit_num, try_num, job_id, platform, state,
+       time_submit, time_run, time_run_exit, queue_s, run_s,
+       cores, nodes, mem_gb, time_limit_min, account, partition,
+       round(cores * run_s / 3600.0, 2) AS core_hours,
+       round((1.4 * cores + 0.20 * coalesce(mem_gb, 0)) * run_s / 3600.0, 2) AS rsu,
+       round(max_rss / 1073741824.0, 2) AS max_rss_gb,
+       round(nullif(memory_allocated, 0) / 1073741824.0, 2) AS mem_allocated_gb,
+       round(cpu_time_ms / 3600000.0, 3) AS cpu_hours,
+       CASE WHEN nodes = 1 THEN round(cpu_time_ms / 1000.0 / (cores * run_s), 3) END AS cpu_efficiency,
+       job_err
+FROM timed;
 
--- Each task's latest event: where every task of every workflow is now.
-CREATE VIEW IF NOT EXISTS task_states AS
-SELECT e.workflow, e.cycle, e.label, e.task, e.event AS state, e.try_num, e.submit_num, e.job_id,
-       e.received_at AS since, e.log_tail
-FROM events e
-JOIN (
-    SELECT workflow, cycle, task, max(id) AS id FROM events WHERE task IS NOT NULL GROUP BY workflow, cycle, task
-) latest ON latest.id = e.id;
-
--- Each workflow's tasks counted by state, and its heartbeat.
-CREATE VIEW IF NOT EXISTS workflow_summary AS
-SELECT s.workflow,
-       sum(s.state = 'succeeded') AS succeeded,
-       sum(s.state IN ('started', 'submitted')) AS active,
-       sum(s.state IN ('failed', 'submission failed')) AS failed,
-       sum(s.state IN ('retry', 'submission retry')) AS retrying,
-       max(s.since) AS last_task_event,
-       h.status AS scheduler, h.seen_at AS heartbeat_at, h.host
-FROM task_states s
-LEFT JOIN heartbeats h ON h.workflow = s.workflow
-GROUP BY s.workflow;
+-- One row a workflow: its scheduler, its jobs by state, what it has used.
+-- health: the scheduler's last word (running, paused, stalled, stopped), or `silent` when a
+-- scheduler not stopped hasn't uploaded for three heartbeats (it, its host or the network
+-- may be down). Active workflows are those not stopped.
+CREATE VIEW workflows AS
+SELECT m.workflow,
+       CASE WHEN m.status != 'stopped' AND (julianday('now') - julianday(m.uploaded_at)) * 86400 > 3 * m.interval_s
+            THEN 'silent' ELSE m.status END AS health,
+       m.uploaded_at, m.host,
+       (SELECT value FROM workflow_params w WHERE w.workflow = m.workflow AND key = 'is_paused') AS is_paused,
+       sum(j.state = 'submitted') AS submitted, sum(j.state = 'running') AS running,
+       sum(j.state = 'succeeded') AS succeeded, sum(j.state IN ('failed', 'submit-failed')) AS failed,
+       round(sum(j.core_hours), 1) AS core_hours, round(sum(j.rsu), 1) AS rsu
+FROM monitor m
+LEFT JOIN jobs j ON j.workflow = m.workflow
+GROUP BY m.workflow;

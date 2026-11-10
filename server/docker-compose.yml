@@ -4,19 +4,10 @@
 #   cp env.example .env && chmod 600 .env && $EDITOR .env   # once: the secret and password hash
 #   sudo docker compose up -d --build
 services:
-  init:
-    build: .
-    # Create the tables and views if they aren't there; then exit.
-    command: python -c "import sqlite3; c = sqlite3.connect('/data/cylc.db'); c.executescript(open('/app/schema.sql').read()); c.close()"
-    volumes:
-      - ./data:/data
   datasette:
     build: .
-    depends_on:
-      init:
-        condition: service_completed_successfully
     command: >
-      datasette serve /data/cylc.db --config /app/datasette.yaml --plugins-dir /app/plugins --template-dir /app/templates
+      datasette serve /data/cylc.db --create --config /app/datasette.yaml --plugins-dir /app/plugins
       --host 0.0.0.0 --port 8001
       --setting sql_time_limit_ms 3000 --setting max_returned_rows 5000
     environment:

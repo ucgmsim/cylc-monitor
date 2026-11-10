@@ -1,42 +1,110 @@
 # The monitor's Datasette: nothing for anonymous visitors. Three actors:
 #   admin        a person in the browser, logged in at /-/login (datasette-auth-passwords)
-#   cylc-writer  cylc_monitor_event.py and cylc_monitor_heartbeat.py on the scheduler host:
-#                a token that may only add events and upsert heartbeats
-#                (make_token.py writer: create-token --resource ... insert-row/update-row)
+#   cylc-writer  cylc_monitor_upload.py on the scheduler host: a token whose only use is
+#                POST /-/cylc/upload (plugins/cylc_upload.py checks the actor's id)
 #   cylc-reader  whoever follows the runs off the cluster (a person's script, an agent):
 #                a token that may only read and run read-only SQL (make_token.py reader)
 title: Cylc monitor
-description: Cylc workflow events and scheduler heartbeats, posted by the workflows' own event handlers.
+description: Cylc workflows' own databases, uploaded from the scheduler host as they change.
 allow:
   id: [admin, cylc-reader, cylc-writer]
-databases:
-  cylc:
-    tables:
-      events:
-        permissions:
-          insert-row:
-            id: cylc-writer
-      heartbeats:
-        permissions:
-          insert-row:
-            id: cylc-writer
-          update-row:
-            id: cylc-writer
 plugins:
   datasette-auth-passwords:
     admin_password_hash:
       $env: ADMIN_PASSWORD_HASH
-  # The status page (plugins/cylc_status.py).
-  cylc-status:
-    # Fold tasks into one grid column. Each rule's `match` is a regular expression that
-    # must match the whole task name; the first rule that matches names the column, and
-    # `column` may use the match's groups (\1, \g<name>). A task no rule matches is its
-    # own column. With no rules (the default) every task is its own column.
-    # For example, one SW4 task a cycle named sw4_<event>, shown as one `sw4` column:
-    #   columns:
-    #     - match: 'sw4_.*'
-    #       column: sw4
-    columns: []
-    # The scheduler is `silent` once its `running` heartbeat is older than this many
-    # of its heartbeat intervals.
-    stale_intervals: 3
+  # /-/dashboards/cylc. Active workflows: those not stopped (running, paused, stalled or silent).
+  datasette-dashboards:
+    cylc:
+      title: Cylc workflows
+      description: Jobs submitted, running and finished, what they asked for and what they used. Core-hours and RSUs count from each job's start to its end, or to its workflow's last upload.
+      filters:
+        workflow:
+          name: Workflow
+          type: select
+          db: cylc
+          query: SELECT workflow FROM monitor ORDER BY uploaded_at DESC
+      layout:
+        - [running, queued, failed, core-hours, rsu]
+        - [workflows, workflows, workflows, workflows, workflows]
+        - [active, active, active, active, active]
+        - [finished, finished, finished, finished, finished]
+        - [by-task, by-task, by-task, by-task, by-task]
+      charts:
+        running:
+          title: Jobs running
+          db: cylc
+          library: metric
+          display: {field: n}
+          query: >
+            SELECT count(*) AS n FROM jobs JOIN workflows USING (workflow)
+            WHERE state = 'running' AND health != 'stopped' [[ AND workflow = :workflow ]]
+        queued:
+          title: Jobs queued
+          db: cylc
+          library: metric
+          display: {field: n}
+          query: >
+            SELECT count(*) AS n FROM jobs JOIN workflows USING (workflow)
+            WHERE state IN ('submitting', 'submitted') AND health != 'stopped' [[ AND workflow = :workflow ]]
+        failed:
+          title: Failed jobs (retries included)
+          db: cylc
+          library: metric
+          display: {field: n}
+          query: >
+            SELECT count(*) AS n FROM jobs JOIN workflows USING (workflow)
+            WHERE state IN ('failed', 'submit-failed') AND health != 'stopped' [[ AND workflow = :workflow ]]
+        core-hours:
+          title: Core-hours, active workflows
+          db: cylc
+          library: metric
+          display: {field: n}
+          query: >
+            SELECT round(coalesce(sum(core_hours), 0), 1) AS n FROM workflows
+            WHERE health != 'stopped' [[ AND workflow = :workflow ]]
+        rsu:
+          title: RSUs, active workflows
+          db: cylc
+          library: metric
+          display: {field: n}
+          query: >
+            SELECT round(coalesce(sum(rsu), 0), 1) AS n FROM workflows
+            WHERE health != 'stopped' [[ AND workflow = :workflow ]]
+        workflows:
+          title: Workflows
+          db: cylc
+          library: table
+          query: SELECT * FROM workflows WHERE 1 [[ AND workflow = :workflow ]] ORDER BY uploaded_at DESC
+        active:
+          title: Submitted and running jobs, active workflows
+          db: cylc
+          library: table
+          query: >
+            SELECT j.workflow, j.cycle, j.name, j.try_num, j.job_id, j.state, j.time_submit, j.time_run,
+                   j.queue_s, j.run_s, j.cores, j.mem_gb, j.time_limit_min, j.core_hours, j.rsu
+            FROM jobs j JOIN workflows w USING (workflow)
+            WHERE j.state IN ('submitting', 'submitted', 'running') AND w.health != 'stopped'
+              [[ AND j.workflow = :workflow ]]
+            ORDER BY j.state DESC, j.time_submit
+        by-task:
+          title: Core-hours by task
+          db: cylc
+          library: vega-lite
+          display:
+            mark: {type: bar, tooltip: true}
+            encoding:
+              x: {field: name, type: nominal, title: Task, sort: '-y'}
+              y: {field: core_hours, type: quantitative, title: Core-hours}
+              color: {field: workflow, type: nominal, title: Workflow}
+          query: >
+            SELECT workflow, name, round(sum(core_hours), 1) AS core_hours FROM jobs
+            WHERE core_hours > 0 [[ AND workflow = :workflow ]] GROUP BY workflow, name
+        finished:
+          title: Finished jobs, latest 200 (asked for vs used)
+          db: cylc
+          library: table
+          query: >
+            SELECT workflow, cycle, name, try_num, state, time_run_exit, run_s, cores, core_hours, rsu,
+                   mem_gb, max_rss_gb, cpu_hours, cpu_efficiency
+            FROM jobs WHERE state IN ('succeeded', 'failed', 'submit-failed') [[ AND workflow = :workflow ]]
+            ORDER BY time_run_exit DESC LIMIT 200

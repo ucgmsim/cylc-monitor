@@ -1,0 +1,60 @@
+#!/bin/bash -l
+#
+# ++++ THIS IS A CYLC JOB SCRIPT ++++
+# Workflow: monlab/run2
+# Task: 1/sim
+# Job log directory: 1/sim/01
+# Job runner: slurm
+
+# DIRECTIVES:
+#SBATCH --job-name=sim.1.monlab/run2
+#SBATCH --output=cylc-run/monlab/run2/log/job/1/sim/01/job.out
+#SBATCH --error=cylc-run/monlab/run2/log/job/1/sim/01/job.err
+#SBATCH --ntasks=4
+#SBATCH --cpus-per-task=2
+#SBATCH --mem-per-cpu=500M
+#SBATCH --time=00:10:00
+#SBATCH --account=test0001
+if [[ $1 == 'noreinvoke' ]]; then
+    shift
+else
+    exec bash -l "$0" noreinvoke "$@"
+fi
+
+CYLC_FAIL_SIGNALS='EXIT ERR TERM XCPU'
+export CYLC_VERBOSE=false
+export CYLC_DEBUG=false
+export CYLC_VERSION='8.7.0'
+export CYLC_WORKFLOW_ID="monlab/run2"
+
+cylc__job__inst__cylc_env() {
+    # CYLC WORKFLOW ENVIRONMENT:
+    export CYLC_CYCLING_MODE="integer"
+    export CYLC_UTC="False"
+    export CYLC_WORKFLOW_FINAL_CYCLE_POINT="2"
+    export CYLC_WORKFLOW_INITIAL_CYCLE_POINT="1"
+    export CYLC_WORKFLOW_NAME="monlab"
+    export CYLC_WORKFLOW_NAME_BASE="monlab"
+    export CYLC_WORKFLOW_UUID="e8d9a954-18ea-47ed-a50d-49a012a69b7d"
+
+    # CYLC TASK ENVIRONMENT:
+    export CYLC_TASK_COMMS_METHOD=zmq
+    export CYLC_TASK_JOB="1/sim/01"
+    export CYLC_TASK_NAMESPACE_HIERARCHY="root sim"
+    export CYLC_TASK_TRY_NUMBER=1
+    export CYLC_TASK_FLOW_NUMBERS=1
+    export CYLC_PROFILER=True
+    export CYLC_PROFILER_CGROUPS=/sys/fs/cgroup
+    export CYLC_PROFILER_POLL_INTERVAL=PT2S
+}
+
+cylc__job__inst__script() {
+# SCRIPT:
+python3 -c 'import time; x = bytearray(300 * 2**20); time.sleep(20)'
+}
+
+CYLC_RUN_DIR="${CYLC_RUN_DIR:-$HOME/cylc-run}"
+. "${CYLC_RUN_DIR}/${CYLC_WORKFLOW_ID}/.service/etc/job.sh"
+cylc__job__main
+
+#EOF: 1/sim/01
