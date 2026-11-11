@@ -6,10 +6,14 @@
 services:
   datasette:
     build: .
+    # force_https_urls: the server sits behind a TLS reverse proxy that talks plain http to
+    # it. Without it Datasette's absolute URLs, and so datasette-dashboards' chart data
+    # URLs, are http, and the browser blocks them as mixed content: every chart is empty.
     command: >
       datasette serve /data/cylc.db --create --config /app/datasette.yaml --plugins-dir /app/plugins
       --host 0.0.0.0 --port 8001
       --setting sql_time_limit_ms 3000 --setting max_returned_rows 5000
+      --setting force_https_urls 1
     environment:
       DATASETTE_SECRET: ${DATASETTE_SECRET:?set DATASETTE_SECRET in .env}
       ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?set ADMIN_PASSWORD_HASH in .env}

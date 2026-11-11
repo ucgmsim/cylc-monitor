@@ -68,7 +68,7 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
     process = subprocess.Popen(
         [sys.executable, "-m", "datasette", "serve", str(directory / "cylc.db"), "--create",
          "--config", str(SERVER / "datasette.yaml"), "--plugins-dir", str(SERVER / "plugins"),
-         "--host", "127.0.0.1", "--port", str(port)],
+         "--host", "127.0.0.1", "--port", str(port), "--setting", "force_https_urls", "1"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )  # fmt: skip
     url = f"http://127.0.0.1:{port}"
@@ -226,7 +226,10 @@ def test_dashboard_queries_run(monitor: dict) -> None:
     for chart in charts.values():
         query = chart["query"].replace("[[", "/*").replace("]]", "*/")
         sql(monitor, query)  # asserts 200
-    assert request(f"{monitor['url']}/-/dashboards/cylc", monitor["reader"])[0] == 200
+    status_code, body = request(f"{monitor['url']}/-/dashboards/cylc", monitor["reader"])
+    assert status_code == 200
+    # Behind a TLS proxy the charts' data URLs must be https, or the browser blocks them.
+    assert b"'https://127.0.0.1" in body and b"'http://127.0.0.1" not in body
 
 
 def test_status_ignores_a_retry_that_succeeded(monitor: dict, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:

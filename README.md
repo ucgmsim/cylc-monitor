@@ -280,6 +280,25 @@ These steps assume a host with Docker Compose and a reverse proxy that handles T
 4. **Reverse proxy:** adapt `Caddyfile.example` to your hostname, append it to
    `/etc/caddy/Caddyfile`, then run
    `sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy`.
+   `docker-compose.yml` sets Datasette's `force_https_urls`, so the links it makes are
+   https. Without it, behind https, the dashboard's charts render empty: their data URLs
+   are http and the browser blocks them as mixed content.
+
+   If the proxy runs in Docker, not on the host, it can't reach `127.0.0.1:8017`. Put
+   the `datasette` service on the proxy's network instead, with a
+   `docker-compose.override.yml` next to `docker-compose.yml`:
+   ```yaml
+   services:
+     datasette:
+       networks:
+         default:
+         caddy_net:
+           aliases: [cylc-monitor]
+   networks:
+     caddy_net:
+       external: true
+   ```
+   and use `reverse_proxy cylc-monitor:8001` in the Caddy site.
 5. **Tokens:** write each token to a file on the server, then move it to where it's
    used:
    ```sh
