@@ -67,7 +67,7 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
     }
     process = subprocess.Popen(
         [sys.executable, "-m", "datasette", "serve", str(directory / "cylc.db"), "--create",
-         "--config", str(SERVER / "datasette.yaml"), "--plugins-dir", str(SERVER / "plugins"),
+         "--config", str(SERVER / "datasette.yaml"), "--plugins-dir", str(SERVER / "plugins"), "--static", f"assets:{SERVER / 'static'}",
          "--host", "127.0.0.1", "--port", str(port), "--setting", "force_https_urls", "1"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )  # fmt: skip
@@ -239,3 +239,11 @@ def test_status_ignores_a_retry_that_succeeded(monitor: dict, tmp_path: Path, ca
     out = capsys.readouterr().out
     assert "w/run2: RUNNING" in out and "w/run1" not in out  # run1 stopped
     assert "FAILED" not in out
+
+
+def test_dashboard_table_css_is_served(monitor: dict) -> None:
+    status_code, body = request(f"{monitor['url']}/-/dashboards/cylc", monitor["reader"])
+    assert status_code == 200, body
+    assert b"/assets/dashboard.css" in body
+    status_code, body = request(f"{monitor['url']}/assets/dashboard.css", monitor["reader"])
+    assert status_code == 200 and b".dashboard-card-chart td" in body

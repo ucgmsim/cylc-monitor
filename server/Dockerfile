@@ -4,3 +4,4 @@ RUN pip install --no-cache-dir 'datasette==1.0a41' 'datasette-auth-passwords==1.
 WORKDIR /app
 COPY datasette.yaml schema.sql make_token.py /app/
 COPY plugins /app/plugins
+COPY static /app/static

@@ -1,0 +1,22 @@
+/* datasette-dashboards' table charts: a bare <table> with no spacing, so cells run together.
+   Pad the cells and keep each on one line (the chart's wrapper scrolls sideways). */
+.dashboard-card-chart table {
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.dashboard-card-chart th,
+.dashboard-card-chart td {
+  padding: 0.25em 0.75em;
+  white-space: nowrap;
+  text-align: left;
+  border-bottom: 1px solid #e5e7eb;
+}
+.dashboard-card-chart th {
+  position: sticky;
+  top: 0;
+  background: #fff;
+  border-bottom: 2px solid #d1d5db;
+}
+.dashboard-card-chart tbody tr:hover {
+  background: #f5f7fa;
+}

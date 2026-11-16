@@ -10,7 +10,7 @@ services:
     # it. Without it Datasette's absolute URLs, and so datasette-dashboards' chart data
     # URLs, are http, and the browser blocks them as mixed content: every chart is empty.
     command: >
-      datasette serve /data/cylc.db --create --config /app/datasette.yaml --plugins-dir /app/plugins
+      datasette serve /data/cylc.db --create --config /app/datasette.yaml --plugins-dir /app/plugins --static assets:/app/static
       --host 0.0.0.0 --port 8001
       --setting sql_time_limit_ms 3000 --setting max_returned_rows 5000
       --setting force_https_urls 1
