@@ -25,6 +25,7 @@ plugins:
           query: SELECT workflow FROM monitor ORDER BY uploaded_at DESC
       layout:
         - [running, queued, failed, core-hours, rsu]
+        - [throughput, throughput, throughput, cumulative, cumulative]
         - [workflows, workflows, workflows, workflows, workflows]
         - [active, active, active, active, active]
         - [finished, finished, finished, finished, finished]
@@ -70,6 +71,40 @@ plugins:
           query: >
             SELECT round(coalesce(sum(rsu), 0), 1) AS n FROM workflows
             WHERE health != 'stopped' [[ AND workflow = :workflow ]]
+        throughput:
+          title: Jobs finished an hour
+          db: cylc
+          library: vega-lite
+          display:
+            mark: {type: bar, tooltip: true}
+            encoding:
+              x: {field: hour, type: temporal, timeUnit: yearmonthdatehours, title: Hour}
+              y: {field: n, type: quantitative, aggregate: sum, title: Jobs}
+              color:
+                field: state
+                type: nominal
+                title: State
+                scale: {domain: [succeeded, failed, submit-failed], range: ['#4c9a5f', '#d1495b', '#edae49']}
+          query: >
+            SELECT strftime('%Y-%m-%dT%H:00:00Z', coalesce(time_run_exit, time_submit)) AS hour, state, count(*) AS n
+            FROM jobs WHERE state IN ('succeeded', 'failed', 'submit-failed') [[ AND workflow = :workflow ]]
+            GROUP BY hour, state
+        cumulative:
+          title: Core-hours used, finished jobs
+          db: cylc
+          library: vega-lite
+          display:
+            mark: {type: line, interpolate: step-after, point: false, tooltip: true}
+            encoding:
+              x: {field: time_run_exit, type: temporal, title: Time}
+              y: {field: core_hours, type: quantitative, title: Core-hours (cumulative)}
+              color: {field: workflow, type: nominal, title: Workflow}
+          query: >
+            SELECT workflow, strftime('%Y-%m-%dT%H:%M:%SZ', time_run_exit) AS time_run_exit,
+                   round(sum(core_hours) OVER (PARTITION BY workflow ORDER BY julianday(time_run_exit)
+                                               ROWS UNBOUNDED PRECEDING), 1) AS core_hours
+            FROM jobs WHERE time_run_exit IS NOT NULL AND core_hours > 0 [[ AND workflow = :workflow ]]
+            ORDER BY workflow, time_run_exit
         workflows:
           title: Workflows
           db: cylc
