@@ -42,6 +42,10 @@ TABLES = [
 WORKFLOW = re.compile(r"[\w][\w.\-/]{0,200}")
 MAX_BYTES = 256 * 1024 * 1024
 SQLITE_HEADER = b"SQLite format 3\x00"
+# The tables the jobs view joins on a job's key: without these indexes each job rescans its
+# workflow's rows of every one (and parses each task_events message), and the dashboard's
+# queries outrun sql_time_limit_ms on a workflow of a few thousand jobs.
+JOB_KEY_TABLES = ["task_jobs", "task_events", "job_resources", "job_logs"]
 # Columns the views read that older uploaders' snapshots lack: added (empty) if missing.
 VIEW_COLUMNS = {"job_resources": ["runner", "chunks"]}
 
@@ -180,6 +184,12 @@ def views(conn: sqlite3.Connection) -> None:
                 for column in needed:
                     if existing and column not in existing:
                         conn.execute(f"alter table main.{quote(table)} add column {quote(column)}")
+            for table in JOB_KEY_TABLES:
+                if conn.execute("select 1 from sqlite_master where type = 'table' and name = ?", (table,)).fetchone():
+                    conn.execute(
+                        f"create index if not exists {quote(table + '_job')}"
+                        f" on {quote(table)} (workflow, cycle, name, submit_num)"
+                    )
             for statement in SCHEMA.read_text().split(";\n"):
                 if statement.strip():
                     conn.execute(statement)
