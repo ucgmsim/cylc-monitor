@@ -75,14 +75,27 @@ plugins:
             SELECT round(coalesce(sum(rsu), 0), 1) AS n FROM workflows
             WHERE health != 'stopped' [[ AND workflow = :workflow ]]
         throughput:
-          title: Jobs an hour (finished by exit, running by start, queued by submit)
+          title: Jobs over time (finished by exit, running by start, queued by submit)
           db: cylc
           library: vega-lite
           display:
+            # Bars span the step the query picked for the time shown; drag to pan, scroll to zoom.
+            params:
+              - name: zoom
+                select: {type: interval, encodings: [x]}
+                bind: scales
+            # Vega-Lite won't stack bars that have an x2, so stack them here: queued on top.
+            transform:
+              - stack: n
+                groupby: [start]
+                sort: [{field: rank}]
+                as: [y0, y1]
             mark: {type: bar, tooltip: true}
             encoding:
-              x: {field: hour, type: temporal, timeUnit: yearmonthdatehours, title: Hour}
-              y: {field: n, type: quantitative, aggregate: sum, title: Jobs}
+              x: {field: start, type: temporal, title: Time}
+              x2: {field: end}
+              y: {field: y0, type: quantitative, title: Jobs a bar}
+              y2: {field: y1}
               color:
                 field: state
                 type: nominal
@@ -91,19 +104,36 @@ plugins:
                 scale:
                   domain: [queued, running, succeeded, failed, submit-failed]
                   range: ['#9aa5b1', '#4f86c6', '#4c9a5f', '#d1495b', '#edae49']
-              order: {field: rank, type: quantitative}
+              tooltip:
+                - {field: start, type: temporal, title: From, format: '%Y-%m-%d %H:%M'}
+                - {field: bar, type: nominal, title: Bar}
+                - {field: state, type: nominal, title: State}
+                - {field: n, type: quantitative, title: Jobs}
+          # Each job once, at its latest event. The step: the smallest of 1h, 3h, 6h, 12h, 1d and
+          # 1w giving at most 60 bars over the jobs shown (buckets are aligned to UTC).
           query: >
-            SELECT strftime('%Y-%m-%dT%H:00:00Z', coalesce(time_run_exit, time_run, time_submit)) AS hour,
-                   CASE WHEN state IN ('submitting', 'submitted') THEN 'queued' ELSE state END AS state,
-                   CASE state WHEN 'succeeded' THEN 1 WHEN 'failed' THEN 2 WHEN 'submit-failed' THEN 3
-                              WHEN 'running' THEN 4 ELSE 5 END AS rank,
-                   count(*) AS n
-            FROM jobs
-            WHERE coalesce(time_run_exit, time_run, time_submit) IS NOT NULL
-              AND (state IN ('succeeded', 'failed', 'submit-failed')
-                   OR workflow IN (SELECT workflow FROM monitor WHERE status != 'stopped'))
-              [[ AND workflow = :workflow ]]
-            GROUP BY hour, 2, rank
+            WITH j AS (
+              SELECT CAST(strftime('%s', coalesce(time_run_exit, time_run, time_submit)) AS INTEGER) AS t,
+                     CASE WHEN state IN ('submitting', 'submitted') THEN 'queued' ELSE state END AS state,
+                     CASE state WHEN 'succeeded' THEN 1 WHEN 'failed' THEN 2 WHEN 'submit-failed' THEN 3
+                                WHEN 'running' THEN 4 ELSE 5 END AS rank
+              FROM jobs
+              WHERE coalesce(time_run_exit, time_run, time_submit) IS NOT NULL
+                AND (state IN ('succeeded', 'failed', 'submit-failed')
+                     OR workflow IN (SELECT workflow FROM monitor WHERE status != 'stopped'))
+                [[ AND workflow = :workflow ]]
+            ), step AS (
+              SELECT coalesce(min(column1), 604800) AS s
+              FROM (VALUES (3600), (10800), (21600), (43200), (86400), (604800))
+              WHERE (SELECT max(t) - min(t) FROM j) / column1 < 60
+            )
+            SELECT strftime('%Y-%m-%dT%H:%M:%SZ', t / s * s, 'unixepoch') AS start,
+                   strftime('%Y-%m-%dT%H:%M:%SZ', t / s * s + s, 'unixepoch') AS "end",
+                   CASE s WHEN 3600 THEN '1 hour' WHEN 86400 THEN '1 day' WHEN 604800 THEN '1 week'
+                          ELSE (s / 3600) || ' hours' END AS bar,
+                   state, rank, count(*) AS n
+            FROM j, step
+            GROUP BY t / s, state, rank
         cumulative:
           title: Core-hours used, finished jobs
           db: cylc
