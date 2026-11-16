@@ -20,3 +20,17 @@
 .dashboard-card-chart tbody tr:hover {
   background: #f5f7fa;
 }
+/* Sortable headers (static/dashboard.js). */
+.dashboard-card-chart th {
+  cursor: pointer;
+  user-select: none;
+}
+.dashboard-card-chart th:hover {
+  color: #1f6feb;
+}
+.dashboard-card-chart th[aria-sort="ascending"]::after {
+  content: " \25B2";
+}
+.dashboard-card-chart th[aria-sort="descending"]::after {
+  content: " \25BC";
+}

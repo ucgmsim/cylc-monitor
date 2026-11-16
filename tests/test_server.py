@@ -241,9 +241,12 @@ def test_status_ignores_a_retry_that_succeeded(monitor: dict, tmp_path: Path, ca
     assert "FAILED" not in out
 
 
-def test_dashboard_table_css_is_served(monitor: dict) -> None:
+def test_dashboard_table_assets_are_served(monitor: dict) -> None:
     status_code, body = request(f"{monitor['url']}/-/dashboards/cylc", monitor["reader"])
     assert status_code == 200, body
     assert b"/assets/dashboard.css" in body
     status_code, body = request(f"{monitor['url']}/assets/dashboard.css", monitor["reader"])
     assert status_code == 200 and b".dashboard-card-chart td" in body
+    assert b"/assets/dashboard.js" in request(f"{monitor['url']}/-/dashboards/cylc", monitor["reader"])[1]
+    status_code, body = request(f"{monitor['url']}/assets/dashboard.js", monitor["reader"])
+    assert status_code == 200 and b"aria-sort" in body

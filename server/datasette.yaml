@@ -6,8 +6,9 @@
 #                a token that may only read and run read-only SQL (make_token.py reader)
 title: Cylc monitor
 description: Cylc workflows' own databases, uploaded from the scheduler host as they change.
-# Spacing for the dashboard's tables (static/, served at /assets/ by --static).
+# Spacing and click-to-sort for the dashboard's tables (static/, served at /assets/ by --static).
 extra_css_urls: [/assets/dashboard.css]
+extra_js_urls: [/assets/dashboard.js]
 allow:
   id: [admin, cylc-reader, cylc-writer]
 plugins:
