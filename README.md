@@ -237,13 +237,14 @@ over the tables and views works too.
 
 ## Who can see what
 
-Datasette lets in no anonymous visitors. There are three actors:
+Datasette lets in no anonymous visitors. There are four actors:
 
 | Actor | How | May |
 |---|---|---|
 | `admin` | a browser, at `/-/login` (password hash in `.env`) | read everything |
 | `cylc-writer` | a token on the scheduler host, `~/.config/cylc-monitor/token` | upload snapshots; the upload plugin checks the actor's id, and the token may otherwise only view the instance |
-| `cylc-reader` | a token wherever you read from, `~/.config/cylc-monitor/reader-token` | read tables and views, run read-only SQL, see the dashboard |
+| `cylc-reader` | a token wherever you read from, `~/.config/cylc-monitor/reader-token` | read tables and views of both databases, run read-only SQL, see the dashboards |
+| `scan-writer` | a token held by [auto_scan](#the-scan-database) | replace the `scan` database; its plugin checks the actor's id, and the token may otherwise only view the instance |
 
 Tokens are signed with `DATASETTE_SECRET` and don't expire. Changing the secret revokes
 every token.
@@ -276,7 +277,7 @@ These steps assume a host with Docker Compose and a reverse proxy that handles T
 3. **Start it:** `sudo docker compose up -d --build`. To check, run
    `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8017/`. It should print
    403: the server is running and closed to anonymous visitors. The database is
-   `data/cylc.db`. The dashboard errors until the first workflow uploads.
+   `data/cylc.db`, with [auto_scan's](#the-scan-database) beside it in `data/scan.db`. The dashboard errors until the first workflow uploads.
 4. **Reverse proxy:** adapt `Caddyfile.example` to your hostname, append it to
    `/etc/caddy/Caddyfile`, then run
    `sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy`.
@@ -316,6 +317,39 @@ These steps assume a host with Docker Compose and a reverse proxy that handles T
 
 To update the server, copy the changed files over and run
 `sudo docker compose up -d --build` again. The views are remade at startup.
+
+## The scan database
+
+The server also hosts a second database, `scan`, for
+[auto_scan](https://github.com/ucgmsim/auto_scan), which reviews each realtime
+earthquake simulation for scientific and performance problems. It is separate from the
+monitor: nothing in `cylc_monitor/` uses it, and a server nobody uploads to simply has
+an empty `data/scan.db`.
+
+- `server/plugins/scan_upload.py`: `POST /-/scan/upload`. It takes a gzipped snapshot
+  of auto_scan's `scan.db`, up to 200 MB, from the `scan-writer` actor only. It checks
+  that the snapshot is an SQLite database with a `meta.schema_version` it knows. Then,
+  in one transaction, it replaces every table of `scan` with the snapshot's and remakes
+  the views. Unlike the monitor's upload it is a copy, not a merge: auto_scan keeps
+  the whole database elsewhere and sends all of it each time.
+- `server/scan_views.sql`: the views the dashboard reads.
+- `/-/dashboards/scan`, in `server/datasette.yaml`: open findings, events, residuals,
+  SW4 throughput and cost estimates. It errors until the first upload, because the
+  views need the tables.
+
+Mint the token on the server and store it where auto_scan runs, as its
+`AUTO_SCAN_WRITER_TOKEN` secret:
+
+```sh
+sudo docker compose exec -T datasette python /app/make_token.py scan-writer
+```
+
+auto_scan finds the server through one setting, its `DATASETTE_URL` variable, so moving
+the server means changing that and nothing else.
+
+The tables are auto_scan's (`src/auto_scan/db.py` there). When their schema version
+changes, add it to `SCHEMA_VERSIONS` in the plugin and update
+`tests/data/scan_schema.sql`.
 
 ## Reading it
 

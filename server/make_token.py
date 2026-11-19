@@ -2,11 +2,12 @@
 
     python /app/make_token.py writer   # for cylc_monitor_upload.py on the scheduler host
     python /app/make_token.py reader   # for whoever follows the runs off the cluster
+    python /app/make_token.py scan-writer   # for auto_scan, to upload its scan database
 
 The writer's only use is POST /-/cylc/upload (the plugin checks its actor id; the token
-itself may only view the instance); the reader may only read (tables, views and
-read-only SQL, hence the dashboard). Neither expires; rotate
-DATASETTE_SECRET to revoke every token at once.
+itself may only view the instance), and the scan-writer's is POST /-/scan/upload on the
+same terms; the reader may only read (tables, views and read-only SQL, hence the
+dashboards). None expires; rotate DATASETTE_SECRET to revoke every token at once.
 """
 
 import os
@@ -15,6 +16,7 @@ import sys
 
 TOKENS = {
     "writer": ["cylc-writer", "--all", "view-instance"],
+    "scan-writer": ["scan-writer", "--all", "view-instance"],
     "reader": [
         "cylc-reader",
         "--all", "view-instance", "--all", "view-database", "--all", "view-table",
@@ -24,7 +26,7 @@ TOKENS = {
 
 
 def main() -> None:
-    """Print the token named on the command line (writer or reader)."""
+    """Print the token named on the command line (writer, reader or scan-writer)."""
     if len(sys.argv) != 2 or sys.argv[1] not in TOKENS:
         sys.exit(__doc__)
     secret = os.environ["DATASETTE_SECRET"]

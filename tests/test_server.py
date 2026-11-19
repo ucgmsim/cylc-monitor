@@ -6,9 +6,12 @@ uploaded to by the client and read with the reader token.
 
 from __future__ import annotations
 
+import gzip
 import json
+import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -25,6 +28,7 @@ from cylc_monitor import status, upload
 SERVER = Path(__file__).resolve().parent.parent / "server"
 RUN = Path(__file__).resolve().parent / "data" / "run"
 PBS = Path(__file__).resolve().parent / "data" / "pbs"
+SCAN_SCHEMA = Path(__file__).resolve().parent / "data" / "scan_schema.sql"
 SECRET = "test-secret"
 
 
@@ -66,7 +70,7 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
         "PATH": "/usr/bin:/bin",
     }
     process = subprocess.Popen(
-        [sys.executable, "-m", "datasette", "serve", str(directory / "cylc.db"), "--create",
+        [sys.executable, "-m", "datasette", "serve", str(directory / "cylc.db"), str(directory / "scan.db"), "--create",
          "--config", str(SERVER / "datasette.yaml"), "--plugins-dir", str(SERVER / "plugins"), "--static", f"assets:{SERVER / 'static'}",
          "--host", "127.0.0.1", "--port", str(port), "--setting", "force_https_urls", "1"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -87,6 +91,7 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
             "db": directory / "cylc.db",
             "writer": token("writer"),
             "reader": token("reader"),
+            "scan_writer": token("scan-writer"),
         }
     finally:
         process.terminate()
@@ -142,11 +147,15 @@ def test_a_second_upload_replaces_the_first(monitor: dict, tmp_path: Path) -> No
         {"workflow": "w/run1", "status": "stopped"},
         {"workflow": "w/run2", "status": "running"},
     ]
-    # One database: the snapshots never become databases (or files) of their own.
+    # One database each for the monitor and the scan: the snapshots never become
+    # databases (or files) of their own.
     assert {p.name for p in monitor["db"].parent.iterdir()} <= {
         "cylc.db",
         "cylc.db-wal",
         "cylc.db-shm",
+        "scan.db",
+        "scan.db-wal",
+        "scan.db-shm",
     }
 
 
@@ -250,3 +259,94 @@ def test_dashboard_table_assets_are_served(monitor: dict) -> None:
     assert b"/assets/dashboard.js" in request(f"{monitor['url']}/-/dashboards/cylc", monitor["reader"])[1]
     status_code, body = request(f"{monitor['url']}/assets/dashboard.js", monitor["reader"])
     assert status_code == 200 and b"aria-sort" in body
+
+
+def scan_snapshot(tmp_path: Path, schema_version: str = "1", findings: int = 1) -> bytes:
+    """A gzipped scan.db as auto_scan uploads it: one event, one run, a metric and some findings."""
+    path = tmp_path / "scan-snapshot.db"
+    path.unlink(missing_ok=True)
+    db = sqlite3.connect(path)
+    db.executescript(SCAN_SCHEMA.read_text())
+    db.execute("INSERT INTO meta VALUES ('schema_version', ?)", (schema_version,))
+    db.execute(
+        "INSERT INTO events (event_id, cycle, event_dir, origin_time, magnitude) VALUES (?, ?, ?, ?, ?)",
+        ("2026p1", 1, "1-2026p1", "2026-11-17T10:30:48+00:00", 4.8),
+    )
+    db.execute(
+        "INSERT INTO runs (event_id, resolution, status, written) VALUES ('2026p1', '0_5hz', 'succeeded', ?)",
+        ("2026-11-17T20:40:24+00:00",),
+    )
+    db.execute("INSERT INTO metrics VALUES ('2026p1', '0_5hz', 'perf.updates_per_core_s', 5.2e5, NULL, NULL)")
+    for i in range(findings):
+        db.execute(
+            "INSERT INTO findings (check_id, subject, kind, severity, status, title, first_event, last_event, opened_at)"
+            " VALUES (?, '0_5hz', 'perf', 'high', 'open', 'A finding', '2026p1', '2026p1', '2026-11-18T00:00:00+00:00')",
+            (f"perf.check_{i}",),
+        )
+    db.commit()
+    db.close()
+    return gzip.compress(path.read_bytes())
+
+
+def scan_sql(monitor: dict, query: str) -> list[dict]:
+    status_code, body = request(
+        f"{monitor['url']}/scan.json?{urllib.parse.urlencode({'sql': query, '_shape': 'array'})}",
+        monitor["reader"],
+    )
+    assert status_code == 200, body
+    return json.loads(body)
+
+
+def test_only_the_scan_writer_may_upload_the_scan_database(monitor: dict, tmp_path: Path) -> None:
+    body = scan_snapshot(tmp_path)
+    target = f"{monitor['url']}/-/scan/upload"
+    assert request(target, None, body)[0] == 403
+    assert request(target, monitor["reader"], body)[0] == 403
+    assert request(target, monitor["writer"], body)[0] == 403
+    status_code, response = request(target, monitor["scan_writer"], body)
+    assert status_code == 200, response
+    assert json.loads(response)["ok"] is True
+    # The scan-writer's token is no use on the monitor's own upload.
+    assert request(f"{monitor['url']}/-/cylc/upload?workflow=w/run1", monitor["scan_writer"], b"x")[0] == 403
+
+
+def test_a_scan_upload_replaces_the_database_and_makes_the_views(monitor: dict, tmp_path: Path) -> None:
+    target = f"{monitor['url']}/-/scan/upload"
+    assert request(target, monitor["scan_writer"], scan_snapshot(tmp_path, findings=3))[0] == 200
+    assert scan_sql(monitor, "SELECT count(*) AS n FROM findings") == [{"n": 3}]
+    assert scan_sql(monitor, "SELECT count(*) AS n FROM findings_open") == [{"n": 3}]
+    # A later snapshot replaces the earlier one whole: it is a copy, not a merge.
+    assert request(target, monitor["scan_writer"], scan_snapshot(tmp_path, findings=1))[0] == 200
+    assert scan_sql(monitor, "SELECT count(*) AS n FROM findings") == [{"n": 1}]
+    assert scan_sql(monitor, "SELECT event_id FROM events") == [{"event_id": "2026p1"}]
+    # The monitor's own database is untouched by it.
+    assert request(f"{monitor['url']}/cylc.json", monitor["reader"])[0] == 200
+
+
+def test_a_scan_upload_this_server_does_not_know_changes_nothing(monitor: dict, tmp_path: Path) -> None:
+    target = f"{monitor['url']}/-/scan/upload"
+    assert request(target, monitor["scan_writer"], scan_snapshot(tmp_path, findings=2))[0] == 200
+    status_code, response = request(target, monitor["scan_writer"], scan_snapshot(tmp_path, schema_version="999"))
+    assert status_code == 400, response
+    assert request(target, monitor["scan_writer"], b"not a database")[0] == 400
+    assert scan_sql(monitor, "SELECT count(*) AS n FROM findings") == [{"n": 2}]
+
+
+def test_the_scan_dashboard_and_its_charts_load(monitor: dict, tmp_path: Path) -> None:
+    assert request(f"{monitor['url']}/-/scan/upload", monitor["scan_writer"], scan_snapshot(tmp_path))[0] == 200
+    assert request(f"{monitor['url']}/-/dashboards/scan", monitor["reader"])[0] == 200
+    import yaml
+
+    charts = yaml.safe_load((SERVER / "datasette.yaml").read_text())["plugins"]["datasette-dashboards"]["scan"][
+        "charts"
+    ]
+    for name, chart in charts.items():
+        if "query" not in chart:
+            continue
+        # A filter's [[ ... ]] clause is dropped when the filter is unset, as the dashboard does.
+        query = re.sub(r"\[\[.*?\]\]", "", chart["query"], flags=re.DOTALL)
+        status_code, body = request(
+            f"{monitor['url']}/{chart['db']}.json?{urllib.parse.urlencode({'sql': query, '_shape': 'array'})}",
+            monitor["reader"],
+        )
+        assert status_code == 200, (name, body)
