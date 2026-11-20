@@ -1,16 +1,18 @@
-# The monitor's Datasette: nothing for anonymous visitors. Three actors:
+# The monitor's Datasette: nothing for anonymous visitors. Four actors:
 #   admin        a person in the browser, logged in at /-/login (datasette-auth-passwords)
 #   cylc-writer  cylc_monitor_upload.py on the scheduler host: a token whose only use is
 #                POST /-/cylc/upload (plugins/cylc_upload.py checks the actor's id)
+#   scan-writer  auto_scan's `auto-scan push`: a token whose only use is POST /-/scan/upload
+#                and /-/scan/upload/cmt (plugins/scan_upload.py checks the actor's id)
 #   cylc-reader  whoever follows the runs off the cluster (a person's script, an agent):
 #                a token that may only read and run read-only SQL (make_token.py reader)
 title: Cylc monitor
-description: Cylc workflows' own databases, uploaded from the scheduler host as they change.
+description: Cylc workflows' own databases, uploaded from the scheduler host as they change, and auto_scan's reviews.
 # Spacing and click-to-sort for the dashboard's tables (static/, served at /assets/ by --static).
 extra_css_urls: [/assets/dashboard.css]
 extra_js_urls: [/assets/dashboard.js]
 allow:
-  id: [admin, cylc-reader, cylc-writer]
+  id: [admin, cylc-reader, cylc-writer, scan-writer]
 plugins:
   datasette-auth-passwords:
     admin_password_hash:
@@ -190,3 +192,395 @@ plugins:
                    mem_gb, max_rss_gb, cpu_hours, cpu_efficiency
             FROM jobs WHERE state IN ('succeeded', 'failed', 'submit-failed') [[ AND workflow = :workflow ]]
             ORDER BY time_run_exit DESC LIMIT 200
+    # /-/dashboards/scan and /-/dashboards/cmt: auto_scan's reviews of the realtime simulations and of
+    # SeismicNow's automatic CMTs, over the scan and cmt databases it uploads (plugins/scan_upload.py,
+    # scan_views.sql, cmt_views.sql). Each errors until its first upload.
+    scan:
+      title: auto_scan
+      description: >-
+        Scientific and performance review of every realtime simulation. Findings are what the
+        checks flagged; each is filed as a GitHub issue in the repository at fault, and verified
+        on later events. Residuals are ln(observed / simulated).
+      filters:
+        resolution:
+          name: Resolution
+          type: select
+          db: scan
+          query: SELECT DISTINCT resolution FROM runs ORDER BY resolution
+          default: 1hz
+        im:
+          name: Intensity measure
+          type: select
+          db: scan
+          query: SELECT DISTINCT im FROM science_event_terms ORDER BY im
+      layout:
+        - [open, serious, filed, verified]
+        - [by-kind, by-kind, failure-classes, failure-classes]
+        - [findings, findings, findings, findings]
+        - [events, events, events, events]
+        - [event-terms, event-terms, xres, xres]
+        - [speed, speed, cost, cost]
+        - [mpi, mpi, time-to-results, time-to-results]
+        - [recent, recent, recent, recent]
+        - [station-bias, station-bias, timers, timers]
+      charts:
+        open:
+          title: Open findings, not yet filed
+          db: scan
+          library: metric
+          display: {field: n}
+          query: SELECT count(*) AS n FROM findings_open WHERE status = 'open'
+        serious:
+          title: Critical or high, not closed
+          db: scan
+          library: metric
+          display: {field: n}
+          query: SELECT count(*) AS n FROM findings_open WHERE severity IN ('critical', 'high')
+        filed:
+          title: Filed, awaiting a fix
+          db: scan
+          library: metric
+          display: {field: n}
+          query: SELECT count(*) AS n FROM findings_open WHERE status IN ('filed', 'fix_pending', 'regressed')
+        verified:
+          title: Verified fixed, last 30 days
+          db: scan
+          library: metric
+          display: {field: n}
+          query: >
+            SELECT count(*) AS n FROM findings_recent
+            WHERE status = 'verified' AND julianday(verified_at) >= julianday('now') - 30
+        by-kind:
+          title: Findings not closed, by kind and severity
+          db: scan
+          library: vega-lite
+          display:
+            mark: {type: bar, tooltip: true}
+            encoding:
+              x: {field: kind, type: nominal, title: Kind}
+              y: {field: n, type: quantitative, title: Findings}
+              color:
+                field: severity
+                type: nominal
+                title: Severity
+                sort: [critical, high, medium, low]
+                scale: {domain: [critical, high, medium, low], range: ['#b60205', '#d93f0b', '#fbca04', '#c2e0c6']}
+          query: SELECT kind, severity, count(*) AS n FROM findings_open GROUP BY kind, severity
+        failure-classes:
+          title: Failed jobs by class (job.err tail)
+          db: scan
+          library: vega-lite
+          display:
+            mark: {type: bar, tooltip: true}
+            encoding:
+              y: {field: failure_class, type: nominal, title: Class, sort: '-x'}
+              x: {field: n, type: quantitative, title: Failed jobs}
+              color: {field: task, type: nominal, title: Task}
+          query: >
+            SELECT failure_class, replace(replace(replace(name, '_0_25hz', ''), '_0_5hz', ''), '_1hz', '') AS task,
+                   count(*) AS n
+            FROM job_failures GROUP BY failure_class, task
+        findings:
+          title: Findings not closed (issue links in issue_url)
+          db: scan
+          library: table
+          query: >
+            SELECT id, severity, kind, status, title, check_id, subject, n_failing, first_event, last_event,
+                   issue_url, updated_at
+            FROM findings_open ORDER BY severity_rank, status = 'open' DESC, updated_at DESC
+        events:
+          title: Latest events
+          db: scan
+          library: table
+          query: >
+            SELECT event_id, origin_time, magnitude, location, status_0_25hz, status_0_5hz, status_1hz,
+                   n_failing_checks, n_checks, n_findings_opened, event_term_pgv_1hz, event_term_lf_1hz,
+                   event_term_hf_1hz, xres_0_25hz_1hz, hours_to_results_1hz, core_hours, jobs_failed
+            FROM event_summary ORDER BY origin_time DESC LIMIT 50
+        event-terms:
+          title: Event term per event by IM, ln(obs / sim) (pick a resolution and an IM)
+          db: scan
+          library: vega-lite
+          display:
+            mark: {type: line, point: true, tooltip: true}
+            encoding:
+              x: {field: origin_time, type: temporal, title: Event origin}
+              y: {field: event_term, type: quantitative, title: Median residual (ln)}
+              color: {field: im, type: nominal, title: IM}
+          query: >
+            SELECT event_id, origin_time, magnitude, resolution, im, event_term, mad_sigma, n_stations
+            FROM science_event_terms WHERE event_term IS NOT NULL
+            [[ AND resolution = :resolution ]] [[ AND im = :im ]]
+            ORDER BY origin_time
+        xres:
+          title: Cross-resolution mismatch per event, median ln(fine / coarse) at long periods
+          db: scan
+          library: vega-lite
+          display:
+            mark: {type: line, point: true, tooltip: true}
+            encoding:
+              x: {field: origin_time, type: temporal, title: Event origin}
+              y: {field: median_mismatch, type: quantitative, title: Median ln(fine / coarse)}
+              color: {field: pair, type: nominal, title: Resolutions}
+          query: >
+            SELECT event_id, origin_time, magnitude, pair, median_mismatch, mad_sigma, n_sites
+            FROM xres_by_event WHERE median_mismatch IS NOT NULL ORDER BY origin_time
+        speed:
+          title: SW4 grid-point updates per core-second, per run
+          db: scan
+          library: vega-lite
+          display:
+            mark: {type: line, point: true, tooltip: true}
+            encoding:
+              x: {field: origin_time, type: temporal, title: Event origin}
+              y: {field: updates_per_core_s, type: quantitative, title: Updates per core-second}
+              color: {field: resolution, type: nominal, title: Resolution}
+          query: >
+            SELECT event_id, origin_time, resolution, updates_per_core_s, cores, nodes
+            FROM perf_by_run WHERE updates_per_core_s IS NOT NULL ORDER BY origin_time
+        cost:
+          title: Estimated against actual SW4 core-hours (the line is equal)
+          db: scan
+          library: vega-lite
+          display:
+            layer:
+              - mark: {type: point, filled: true, tooltip: true}
+                encoding:
+                  x: {field: actual_core_hours, type: quantitative, title: Actual core-hours, scale: {type: log}}
+                  y: {field: estimated_core_hours, type: quantitative, title: Estimated core-hours, scale: {type: log}}
+                  color: {field: resolution, type: nominal, title: Resolution}
+              - mark: {type: line, color: '#888888', strokeDash: [4, 4]}
+                encoding:
+                  x: {field: actual_core_hours, type: quantitative}
+                  y: {field: actual_core_hours, type: quantitative}
+          query: >
+            SELECT event_id, resolution, actual_core_hours, estimated_core_hours, cost_ratio, budget_core_hours
+            FROM perf_by_run WHERE actual_core_hours > 0 AND estimated_core_hours > 0
+        mpi:
+          title: MPI fraction of SW4's solve time, per run
+          db: scan
+          library: vega-lite
+          display:
+            mark: {type: line, point: true, tooltip: true}
+            encoding:
+              x: {field: origin_time, type: temporal, title: Event origin}
+              y: {field: mpi_fraction, type: quantitative, title: MPI time / solve time}
+              color: {field: resolution, type: nominal, title: Resolution}
+          query: >
+            SELECT event_id, origin_time, resolution, mpi_fraction, rank_imbalance, nodes
+            FROM perf_by_run WHERE mpi_fraction IS NOT NULL ORDER BY origin_time
+        time-to-results:
+          title: Hours from the earthquake to uploaded results, per run
+          db: scan
+          library: vega-lite
+          display:
+            mark: {type: bar, tooltip: true}
+            encoding:
+              x: {field: event_id, type: nominal, title: Event, sort: {field: origin_time}}
+              y: {field: hours_to_results, type: quantitative, title: Hours from origin}
+              color: {field: resolution, type: nominal, title: Resolution}
+              xOffset: {field: resolution}
+          query: >
+            SELECT event_id, origin_time, resolution, hours_to_results, queue_s, run_s
+            FROM perf_by_run WHERE hours_to_results IS NOT NULL ORDER BY origin_time
+        recent:
+          title: Findings, latest changes first (verified and dismissed included)
+          db: scan
+          library: table
+          query: >
+            SELECT id, status, severity, kind, title, check_id, subject, first_event, last_event, issue_url,
+                   issue_closed_at, verified_event, verified_at, updated_at
+            FROM findings_recent ORDER BY updated_at DESC LIMIT 100
+        station-bias:
+          title: Stations with the largest site terms (mean residual after the event term, n >= 3 events)
+          db: scan
+          library: table
+          query: >
+            SELECT station, resolution, im, n_events, site_term, site_sigma, mean_rrup_km, vs30
+            FROM station_bias WHERE n_events >= 3 [[ AND resolution = :resolution ]] [[ AND im = :im ]]
+            ORDER BY abs(site_term) DESC LIMIT 50
+        timers:
+          title: SW4's slowest timer regions, latest run
+          db: scan
+          library: table
+          query: >
+            SELECT t.event_id, t.resolution, t.region, t.depth, t.calls_total, t.avg_s, t.max_s, t.imbalance,
+                   t.mpi_avg_s, t.omp_wait_frac
+            FROM timers_top t
+            WHERE t.rank <= 15 AND t.event_id = (SELECT event_id FROM timers_top ORDER BY origin_time DESC LIMIT 1)
+              [[ AND t.resolution = :resolution ]]
+            ORDER BY t.resolution, t.rank
+    cmt:
+      title: auto_scan CMT review
+      description: >-
+        Scientific and performance review of every automatic CMT SeismicNow posts (cmt_solutions'
+        auto_cmt running BayesISOLA three times an event). Findings are what the checks flagged;
+        each is filed as a GitHub issue in ucgmsim/cmt_solutions, and verified on later CMTs.
+      filters:
+        run:
+          name: Run
+          type: select
+          db: cmt
+          query: SELECT DISTINCT resolution FROM runs ORDER BY resolution
+      layout:
+        - [open, serious, filed, verified]
+        - [by-kind, by-kind, magnitude, magnitude]
+        - [findings, findings, findings, findings]
+        - [events, events, events, events]
+        - [vr, vr, chi2, chi2]
+        - [stages, stages, time-to-solution, time-to-solution]
+        - [runs, runs, runs, runs]
+        - [recent, recent, recent, recent]
+      charts:
+        open:
+          title: Open findings, not yet filed
+          db: cmt
+          library: metric
+          display: {field: n}
+          query: SELECT count(*) AS n FROM findings_open WHERE status = 'open'
+        serious:
+          title: Critical or high, not closed
+          db: cmt
+          library: metric
+          display: {field: n}
+          query: SELECT count(*) AS n FROM findings_open WHERE severity IN ('critical', 'high')
+        filed:
+          title: Filed, awaiting a fix
+          db: cmt
+          library: metric
+          display: {field: n}
+          query: SELECT count(*) AS n FROM findings_open WHERE status IN ('filed', 'fix_pending', 'regressed')
+        verified:
+          title: Verified fixed, last 30 days
+          db: cmt
+          library: metric
+          display: {field: n}
+          query: >
+            SELECT count(*) AS n FROM findings_recent
+            WHERE status = 'verified' AND julianday(verified_at) >= julianday('now') - 30
+        by-kind:
+          title: Findings not closed, by kind and severity
+          db: cmt
+          library: vega-lite
+          display:
+            mark: {type: bar, tooltip: true}
+            encoding:
+              x: {field: kind, type: nominal, title: Kind}
+              y: {field: n, type: quantitative, title: Findings}
+              color:
+                field: severity
+                type: nominal
+                title: Severity
+                sort: [critical, high, medium, low]
+                scale: {domain: [critical, high, medium, low], range: ['#b60205', '#d93f0b', '#fbca04', '#c2e0c6']}
+          query: SELECT kind, severity, count(*) AS n FROM findings_open GROUP BY kind, severity
+        magnitude:
+          title: CMT Mw against GeoNet's magnitude (the line is equal)
+          db: cmt
+          library: vega-lite
+          display:
+            layer:
+              - mark: {type: point, filled: true, tooltip: true}
+                encoding:
+                  x: {field: geonet_magnitude, type: quantitative, title: GeoNet M, scale: {zero: false}}
+                  y: {field: mw, type: quantitative, title: CMT Mw, scale: {zero: false}}
+                  color: {field: n_stations, type: quantitative, title: Stations}
+              - mark: {type: line, color: '#888888', strokeDash: [4, 4]}
+                encoding:
+                  x: {field: geonet_magnitude, type: quantitative}
+                  y: {field: geonet_magnitude, type: quantitative}
+          query: >
+            SELECT event_id, geonet_magnitude, mw, mw_minus_geonet, n_stations, vr
+            FROM cmt_event_summary WHERE mw IS NOT NULL AND geonet_magnitude IS NOT NULL
+        findings:
+          title: Findings not closed (issue links in issue_url)
+          db: cmt
+          library: table
+          query: >
+            SELECT id, severity, kind, status, title, check_id, subject, n_failing, first_event, last_event,
+                   issue_url, updated_at
+            FROM findings_open ORDER BY severity_rank, status = 'open' DESC, updated_at DESC
+        events:
+          title: Latest CMTs
+          db: cmt
+          library: table
+          query: >
+            SELECT event_id, origin_time, location, selected_run, mw, geonet_magnitude, mw_minus_geonet, vr,
+                   n_stations, n_runs_ok, n_runs, minutes_to_solution, pipeline_minutes, n_failing_checks, n_checks
+            FROM cmt_event_summary ORDER BY computed_at DESC LIMIT 50
+        vr:
+          title: Variance reduction per event and run (pick a run)
+          db: cmt
+          library: vega-lite
+          display:
+            mark: {type: line, point: true, tooltip: true}
+            encoding:
+              x: {field: written, type: temporal, title: Computed}
+              y: {field: vr, type: quantitative, title: VR}
+              color: {field: run, type: nominal, title: Run}
+          query: >
+            SELECT event_id, written, run, vr, n_stations, selected
+            FROM cmt_by_run WHERE vr IS NOT NULL [[ AND run = :run ]] ORDER BY written
+        chi2:
+          title: Reduced chi-square over the posterior's variance scale (1 is a calibrated posterior)
+          db: cmt
+          library: vega-lite
+          display:
+            mark: {type: point, filled: true, tooltip: true}
+            encoding:
+              x: {field: written, type: temporal, title: Computed}
+              y: {field: chi2_over_scale, type: quantitative, title: Reduced chi-square / variance scale, scale: {type: log}}
+              color: {field: run, type: nominal, title: Run}
+          query: >
+            SELECT event_id, written, run, reduced_chi_square, variance_scale, posterior_effective_cells,
+                   reduced_chi_square / coalesce(nullif(variance_scale, 0), 1) AS chi2_over_scale
+            FROM cmt_by_run WHERE reduced_chi_square > 0 [[ AND run = :run ]] ORDER BY written
+        stages:
+          title: Where the time goes, latest 20 CMTs (stage seconds; pick a run, default the pipeline)
+          db: cmt
+          library: vega-lite
+          display:
+            mark: {type: bar, tooltip: true}
+            encoding:
+              y: {field: event_id, type: nominal, title: Event, sort: {field: origin_time, order: descending}}
+              x: {field: seconds, type: quantitative, title: Seconds, stack: zero}
+              color: {field: stage, type: nominal, title: Stage}
+          query: >
+            SELECT t.event_id, t.origin_time, t.run, t.stage, t.seconds FROM cmt_timings t
+            WHERE t.stage != 'cleanup' AND ((t.run = 'pipeline' [[ AND :run IS NULL ]]) [[ OR t.run = :run ]])
+              AND t.event_id IN (SELECT event_id FROM cmt_event_summary ORDER BY computed_at DESC LIMIT 20)
+        time-to-solution:
+          title: Minutes from the earthquake to the CMT, and the pipeline's own minutes
+          db: cmt
+          library: vega-lite
+          display:
+            mark: {type: bar, tooltip: true}
+            encoding:
+              x: {field: event_id, type: nominal, title: Event, sort: {field: origin_time}}
+              y: {field: minutes, type: quantitative, title: Minutes}
+              color: {field: measure, type: nominal, title: Measure}
+              xOffset: {field: measure}
+          query: >
+            SELECT event_id, origin_time, 'origin to solution' AS measure, minutes_to_solution AS minutes
+            FROM cmt_event_summary WHERE minutes_to_solution IS NOT NULL
+            UNION ALL
+            SELECT event_id, origin_time, 'pipeline' AS measure, pipeline_minutes AS minutes
+            FROM cmt_event_summary WHERE pipeline_minutes IS NOT NULL
+            ORDER BY origin_time
+        runs:
+          title: Every run of the latest CMTs
+          db: cmt
+          library: table
+          query: >
+            SELECT event_id, run, status, selected, n_stations, vr, mw, dc_percent, clvd_percent, iso_percent,
+                   centroid_depth_km, on_grid_edge, posterior_boundary_probability, reduced_chi_square,
+                   kagan_to_selected_deg, jackknife_max_kagan_deg, negative_vr_fraction, total_s
+            FROM cmt_by_run WHERE 1 = 1 [[ AND run = :run ]] ORDER BY written DESC, run LIMIT 150
+        recent:
+          title: Findings, latest changes first (verified and dismissed included)
+          db: cmt
+          library: table
+          query: >
+            SELECT id, status, severity, kind, title, check_id, subject, first_event, last_event, issue_url,
+                   issue_closed_at, verified_event, verified_at, updated_at
+            FROM findings_recent ORDER BY updated_at DESC LIMIT 100

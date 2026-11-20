@@ -6,6 +6,7 @@ uploaded to by the client and read with the reader token.
 
 from __future__ import annotations
 
+import gzip
 import json
 import shutil
 import socket
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import make_token
 import pytest
+from scan_snapshots import make_cmt_snapshot, make_scan_snapshot
 
 from cylc_monitor import status, upload
 
@@ -66,7 +68,7 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
         "PATH": "/usr/bin:/bin",
     }
     process = subprocess.Popen(
-        [sys.executable, "-m", "datasette", "serve", str(directory / "cylc.db"), "--create",
+        [sys.executable, "-m", "datasette", "serve", *(str(directory / f"{db}.db") for db in ("cylc", "scan", "cmt")), "--create",
          "--config", str(SERVER / "datasette.yaml"), "--plugins-dir", str(SERVER / "plugins"), "--static", f"assets:{SERVER / 'static'}",
          "--host", "127.0.0.1", "--port", str(port), "--setting", "force_https_urls", "1"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -87,15 +89,16 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
             "db": directory / "cylc.db",
             "writer": token("writer"),
             "reader": token("reader"),
+            "scan-writer": token("scan-writer"),
         }
     finally:
         process.terminate()
         process.wait(10)
 
 
-def sql(monitor: dict, query: str) -> list[dict]:
+def sql(monitor: dict, query: str, db: str = "cylc") -> list[dict]:
     status_code, body = request(
-        f"{monitor['url']}/cylc.json?{urllib.parse.urlencode({'sql': query, '_shape': 'array'})}",
+        f"{monitor['url']}/{db}.json?{urllib.parse.urlencode({'sql': query, '_shape': 'array'})}",
         monitor["reader"],
     )
     assert status_code == 200, body
@@ -142,11 +145,9 @@ def test_a_second_upload_replaces_the_first(monitor: dict, tmp_path: Path) -> No
         {"workflow": "w/run1", "status": "stopped"},
         {"workflow": "w/run2", "status": "running"},
     ]
-    # One database: the snapshots never become databases (or files) of their own.
+    # The snapshots never become databases (or files) of their own.
     assert {p.name for p in monitor["db"].parent.iterdir()} <= {
-        "cylc.db",
-        "cylc.db-wal",
-        "cylc.db-shm",
+        f"{db}.db{suffix}" for db in ("cylc", "scan", "cmt") for suffix in ("", "-wal", "-shm")
     }
 
 
@@ -250,3 +251,26 @@ def test_dashboard_table_assets_are_served(monitor: dict) -> None:
     assert b"/assets/dashboard.js" in request(f"{monitor['url']}/-/dashboards/cylc", monitor["reader"])[1]
     status_code, body = request(f"{monitor['url']}/assets/dashboard.js", monitor["reader"])
     assert status_code == 200 and b"aria-sort" in body
+
+
+def test_auto_scan_upload(monitor: dict, tmp_path: Path) -> None:
+    scan, cmt = tmp_path / "scan-upload.db", tmp_path / "cmt-upload.db"
+    make_scan_snapshot(scan)
+    make_cmt_snapshot(cmt)
+    target = f"{monitor['url']}/-/scan/upload"
+    body = gzip.compress(scan.read_bytes())
+    for actor in (None, "reader", "writer"):  # only the scan-writer may upload
+        assert request(target, monitor.get(actor or ""), body)[0] == 403
+    assert request(target, monitor["scan-writer"], b"not sqlite")[0] == 400
+    assert request(f"{target}/cylc", monitor["scan-writer"], body)[0] == 404
+
+    status_code, reply = request(target, monitor["scan-writer"], body)
+    assert status_code == 200 and json.loads(reply)["rows"]["events"] == 6
+    status_code, reply = request(f"{target}/cmt", monitor["scan-writer"], gzip.compress(cmt.read_bytes()))
+    assert status_code == 200 and json.loads(reply)["rows"]["runs"] == 6
+
+    assert sql(monitor, "select count(*) as n from event_summary", "scan") == [{"n": 6}]
+    assert sql(monitor, "select count(*) as n from cmt_event_summary", "cmt") == [{"n": 2}]
+    for board in ("scan", "cmt"):
+        status_code, page = request(f"{monitor['url']}/-/dashboards/{board}", monitor["reader"])
+        assert status_code == 200, page

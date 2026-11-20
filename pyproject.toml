@@ -60,7 +60,7 @@ extend_exclude = ["server"]
 cylc-flow = "cylc"
 
 [tool.ty.environment]
-extra-paths = ["server", "server/plugins"]
+extra-paths = ["server", "server/plugins", "tests"]
 
 [tool.ruff.lint]
 extend-select = [

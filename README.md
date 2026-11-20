@@ -40,8 +40,9 @@ scheduler (cluster)                              server (e.g. a VPS; reverse pro
   - `status.py`: the command `cylc-monitor-status`, the reader. It prints each active
     workflow's state and exits 1 if something needs a person.
 - `server/`: the Datasette side, run with Docker Compose. It has the views
-  (`schema.sql`), the permissions and dashboard (`datasette.yaml`), the upload plugin,
-  a token maker and an example Caddy site.
+  (`schema.sql`), the permissions and dashboards (`datasette.yaml`), the upload plugin,
+  a token maker and an example Caddy site. It also hosts auto_scan's databases (see
+  [auto_scan's databases](#auto_scans-databases)).
 - `examples/global.cylc`: the Cylc configuration that turns the plugin on.
 
 Datasette is pinned to 1.0a41 (for its tokens), datasette-auth-passwords to 1.1.1 and
@@ -235,15 +236,34 @@ stores that in `task_events`, and the `jobs` view turns it into `max_rss_gb`,
 It has a filter for one workflow. The charts are in `server/datasette.yaml`. Any SQL
 over the tables and views works too.
 
+## auto_scan's databases
+
+The same Datasette hosts the two databases of
+[auto_scan](https://github.com/ucgmsim/auto_scan), which reviews the realtime
+simulations and SeismicNow's automatic CMTs:
+- `scan`: the simulation review, with its dashboard at `/-/dashboards/scan`;
+- `cmt`: the CMT review, with its dashboard at `/-/dashboards/cmt`.
+
+`auto-scan push` uploads each database whole with the `scan-writer` token, to
+`POST /-/scan/upload` (scan) and `POST /-/scan/upload/cmt` (cmt). The upload replaces
+every table of that database in one transaction, then remakes its views. The upload
+plugin is `server/plugins/scan_upload.py`, and the views are `server/scan_views.sql` and
+`server/cmt_views.sql`. The plugin accepts only a snapshot whose `meta.schema_version`
+it knows. When auto_scan changes its schema, change the plugin and the views here too.
+
+The `scan` and `cmt` databases start empty, so their dashboards error until their first
+upload.
+
 ## Who can see what
 
-Datasette lets in no anonymous visitors. There are three actors:
+Datasette lets in no anonymous visitors. There are four actors:
 
 | Actor | How | May |
 |---|---|---|
 | `admin` | a browser, at `/-/login` (password hash in `.env`) | read everything |
 | `cylc-writer` | a token on the scheduler host, `~/.config/cylc-monitor/token` | upload snapshots; the upload plugin checks the actor's id, and the token may otherwise only view the instance |
-| `cylc-reader` | a token wherever you read from, `~/.config/cylc-monitor/reader-token` | read tables and views, run read-only SQL, see the dashboard |
+| `scan-writer` | a token in auto_scan's repository secret `AUTO_SCAN_WRITER_TOKEN` | upload auto_scan's databases; like `cylc-writer`, the token may otherwise only view the instance |
+| `cylc-reader` | a token wherever you read from, `~/.config/cylc-monitor/reader-token` | read tables and views, run read-only SQL, see the dashboards |
 
 Tokens are signed with `DATASETTE_SECRET` and don't expire. Changing the secret revokes
 every token.
@@ -275,8 +295,9 @@ These steps assume a host with Docker Compose and a reverse proxy that handles T
      ```
 3. **Start it:** `sudo docker compose up -d --build`. To check, run
    `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8017/`. It should print
-   403: the server is running and closed to anonymous visitors. The database is
-   `data/cylc.db`. The dashboard errors until the first workflow uploads.
+   403: the server is running and closed to anonymous visitors. The databases are
+   `data/cylc.db`, `data/scan.db` and `data/cmt.db`. Each dashboard errors until its
+   first upload.
 4. **Reverse proxy:** adapt `Caddyfile.example` to your hostname, append it to
    `/etc/caddy/Caddyfile`, then run
    `sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy`.
@@ -313,6 +334,17 @@ These steps assume a host with Docker Compose and a reverse proxy that handles T
    chmod 600 ~/.config/cylc-monitor/reader-token
    ssh server rm cylc-monitor/writer.token cylc-monitor/reader.token
    ```
+6. **auto_scan's token:** make the `scan-writer` token and store it as the repository
+   secret `AUTO_SCAN_WRITER_TOKEN` in ucgmsim/auto_scan:
+   ```sh
+   cd ~/cylc-monitor
+   sudo docker compose exec -T datasette python /app/make_token.py scan-writer > scan-writer.token
+   chmod 600 scan-writer.token
+   # From your own machine:
+   ssh server cat cylc-monitor/scan-writer.token | gh secret set AUTO_SCAN_WRITER_TOKEN --repo ucgmsim/auto_scan
+   ssh server rm cylc-monitor/scan-writer.token
+   ```
+   auto_scan also needs the server's URL, in its repository variable `DATASETTE_URL`.
 
 To update the server, copy the changed files over and run
 `sudo docker compose up -d --build` again. The views are remade at startup.
@@ -358,9 +390,12 @@ The run had the profiler on and a stand-in Slurm. `tests/data/pbs` holds the sam
 PBS run. The tests lay them over the run for a PBS workflow. The tests cover:
 - `tests/test_upload.py`: the Slurm and PBS directives, and the snapshot.
 - `tests/test_mainloop.py`: the plugin, driven as the scheduler drives it.
-- `tests/test_server.py`: it starts the server on a temporary database and checks:
+- `tests/test_server.py`: it starts the server on temporary databases and checks:
   - the permissions;
   - that a re-upload replaces rather than adds;
   - the `jobs` view;
   - that every dashboard query runs;
-  - the status reader.
+  - the status reader;
+  - auto_scan's uploads and dashboards.
+- `tests/test_scan_upload.py`: auto_scan's upload plugin, its views and its dashboards'
+  queries, on made-up databases (`tests/scan_snapshots.py`) with auto_scan's tables.
