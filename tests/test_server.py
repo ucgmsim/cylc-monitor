@@ -20,6 +20,7 @@ from pathlib import Path
 
 import make_token
 import pytest
+from datasette.app import Datasette
 from scan_snapshots import make_cmt_snapshot, make_scan_snapshot
 
 from cylc_monitor import queue, status, upload
@@ -65,6 +66,7 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
     env = {
         "DATASETTE_SECRET": SECRET,
         "ADMIN_PASSWORD_HASH": "pbkdf2_sha256$1$x$y",
+        "JOEL_PASSWORD_HASH": "pbkdf2_sha256$1$x$y",
         "PATH": "/usr/bin:/bin",
     }
     process = subprocess.Popen(
@@ -358,3 +360,24 @@ def test_queue_round_trip(monitor: dict, tmp_path: Path, capsys: pytest.CaptureF
     assert queue.main([*cli, "list", "--event", "2026p000003"]) == 0
     assert [j["id"] for j in json.loads(capsys.readouterr().out)] == [job["id"]]
     assert queue.main([*cli, "claim"]) == 1
+
+
+def as_person(monitor: dict, person: str, path: str) -> int:
+    """GET path with the cookie /-/login sets once a password is right: the actor, signed."""
+    cookie = Datasette(secret=SECRET).sign({"a": {"id": person}}, "actor")
+    headers = {"Cookie": f"ds_actor={cookie}"}
+    try:
+        with urllib.request.urlopen(urllib.request.Request(monitor["url"] + path, headers=headers), timeout=10) as r:
+            return r.status
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
+@pytest.mark.parametrize("person", ["admin", "joel"])
+def test_logged_in_people_see_everything(monitor: dict, person: str) -> None:
+    for path in ("/", "/-/dashboards/cylc", "/-/dashboards/scan", "/-/dashboards/cmt", "/queue/jobs"):
+        assert as_person(monitor, person, path) == 200, path
+
+
+def test_a_stranger_with_a_signed_cookie_sees_nothing(monitor: dict) -> None:
+    assert as_person(monitor, "mallory", "/-/dashboards/cylc") == 403

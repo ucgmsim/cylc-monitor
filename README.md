@@ -326,11 +326,11 @@ worker dies stays `running` until something sets it otherwise.
 
 ## Who can see what
 
-Datasette lets in no anonymous visitors. There are five actors:
+Datasette lets in no anonymous visitors. There are six actors:
 
 | Actor | How | May |
 |---|---|---|
-| `admin` | a browser, at `/-/login` (password hash in `.env`) | read everything; insert, update and delete the job queue's rows |
+| `admin`, `joel` | a browser, at `/-/login`, each with their own password (hashes in `.env`) | read everything and see the dashboards; insert, update and delete the job queue's rows |
 | `cylc-writer` | a token on the scheduler host, `~/.config/cylc-monitor/token` | upload snapshots; the upload plugin checks the actor's id, and the token may otherwise only view the instance |
 | `scan-writer` | a token in auto_scan's repository secret `AUTO_SCAN_WRITER_TOKEN` | upload auto_scan's databases; like `cylc-writer`, the token may otherwise only view the instance |
 | `cylc-reader` | a token wherever you read from, `~/.config/cylc-monitor/reader-token` | read tables and views, run read-only SQL, see the dashboards |
@@ -359,11 +359,15 @@ These steps assume a host with Docker Compose and a reverse proxy that handles T
 2. **Secret and password:** `cp env.example .env && chmod 600 .env`.
    - Set `DATASETTE_SECRET` with
      `python3 -c 'import secrets; print(secrets.token_hex(32))'`.
-   - Make the `admin` login's hash on your own machine and paste it, single-quoted, as
-     `ADMIN_PASSWORD_HASH`:
+   - Make each login's hash on your own machine and paste it, single-quoted, as
+     `ADMIN_PASSWORD_HASH` and `JOEL_PASSWORD_HASH`:
      ```sh
      uvx --from datasette-auth-passwords==1.1.1 --with datasette==1.0a41 datasette hash-password
      ```
+   - Another login is a `<user>_password_hash` under `datasette-auth-passwords` in
+     `datasette.yaml` (from an environment variable, as these two are), its hash in
+     `.env` and `docker-compose.yml`'s `environment`, and the user added beside `admin`
+     to the `allow` list and the queue's permissions there.
 3. **Start it:** `sudo docker compose up -d --build`. To check, run
    `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8017/`. It should print
    403: the server is running and closed to anonymous visitors. The databases are
