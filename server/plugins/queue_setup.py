@@ -2,7 +2,7 @@
 
 The queue has no endpoint of its own: SeismicNow and the realtime workflow add and update
 rows with Datasette's JSON write API (``/queue/jobs/-/insert`` and
-``/queue/jobs/<event_id>/-/update``), with the queue-writer token, as datasette.yaml
+``/queue/jobs/<id>/-/update``), with the queue-writer token, as datasette.yaml
 allows. queue.sql only creates what is missing, so restarts keep the queue.
 """
 
