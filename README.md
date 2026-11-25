@@ -259,15 +259,17 @@ upload.
 
 ## The job queue
 
-The `queue` database holds one table, `jobs`: a list of earthquakes to simulate.
-SeismicNow adds an event when it decides the event can be simulated. The realtime
-workflow takes the oldest queued event, runs it, publishes the results to simdb and sets
-the event's status as it goes. Both write with Datasette's own JSON write API, with the
-`queue-writer` token. There is no endpoint of the monitor's own.
+The `queue` database holds one table, `jobs`: earthquakes to simulate, one row (a job)
+for each time one is submitted. SeismicNow submits an event when it decides the event
+can be simulated, and again whenever it wants it simulated again, with a new CMT, say.
+The realtime workflow takes the oldest queued job, runs it, publishes the results to
+simdb and sets the job's status as it goes. Both write with Datasette's own JSON write
+API, with the `queue-writer` token. There is no endpoint of the monitor's own.
 
 | Column | Holds |
 |---|---|
-| `event_id` | the GeoNet PublicID, the primary key: submitting an event already there changes nothing |
+| `id` | the job's, given by the database; the queue runs oldest (lowest) first |
+| `event_id` | the GeoNet PublicID; an event has one job for each time it was submitted, so its earlier jobs are its history |
 | `task_id` | what the worker calls the run, e.g. `realtime/run1//12` |
 | `cmt` | the CMT solution, as JSON |
 | `status` | free text; by convention `queued`, `running`, `succeeded`, `failed` or `cancelled` |
@@ -281,36 +283,45 @@ With the Python client (standard library only, in this package):
 ```python
 from cylc_monitor.queue import connect
 
-q = connect()  # ~/.config/cylc-monitor/url and queue-token
-q.submit("2026p123456", cmt)  # SeismicNow; a no-op if the event is already there
+q = connect(url="https://cylc.example.org", token=token)  # or connect(): the config files
+job = q.submit("2026p123456", cmt)  # SeismicNow: a new job, queued, with its id
+q.submit("2026p123456", new_cmt)  # later: the event again, a second job
 job = q.claim("realtime/run1//12")  # the worker: the oldest queued job, now running; None if none
-q.update("2026p123456", status="succeeded", detail="https://...")
-q.get("2026p123456")
+q.update(job["id"], status="succeeded", detail="https://...")
+q.get(job["id"])
+q.latest("2026p123456")  # the event's newest job
+q.jobs(event_id="2026p123456")  # all its jobs, oldest first
 q.jobs(status="failed")
 ```
 
+`connect()` takes keyword arguments only: `url`, and `token` or `token_file`. What isn't
+given comes from `$CYLC_MONITOR_URL` or `~/.config/cylc-monitor/url`, and
+`$CYLC_MONITOR_QUEUE_TOKEN_FILE` or `~/.config/cylc-monitor/queue-token`.
+
 From a shell, e.g. a Cylc event handler:
 ```sh
-cylc-monitor-queue submit 2026p123456 --cmt cmt.json
+cylc-monitor-queue submit 2026p123456 --cmt cmt.json   # prints the new job, with its id
 cylc-monitor-queue claim --task-id realtime/run1//12   # prints the job as JSON; exits 1 if none
-cylc-monitor-queue set 2026p123456 status=failed detail="sw4 timed out"
+cylc-monitor-queue set 42 status=failed detail="sw4 timed out"
+cylc-monitor-queue latest 2026p123456
 cylc-monitor-queue list --status queued
 ```
 
 Or with plain HTTP, from anything:
 ```sh
 curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"row": {"event_id": "2026p123456", "cmt": {...}}, "ignore": true}' https://cylc.example.org/queue/jobs/-/insert
-curl -H "Authorization: Bearer $TOKEN" 'https://cylc.example.org/queue/jobs.json?status=queued&_sort=created&_size=1&_shape=array'
+  -d '{"row": {"event_id": "2026p123456", "cmt": {...}}}' https://cylc.example.org/queue/jobs/-/insert
+curl -H "Authorization: Bearer $TOKEN" 'https://cylc.example.org/queue/jobs.json?status=queued&_sort=id&_size=1&_shape=array'
 curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"update": {"status": "running"}}' https://cylc.example.org/queue/jobs/2026p123456/-/update
+  -d '{"update": {"status": "running"}}' https://cylc.example.org/queue/jobs/42/-/update
 ```
 
-To re-run an event, set its status back to `queued`. To skip one, set it to
-`cancelled`. The table's page, `/queue/jobs`, lists the jobs in the browser.
+To re-run an event, submit it again. To skip a job, set its status to `cancelled`.
+Submitting an event while it already has a job queued queues it twice: cancel the one
+you no longer want. The table's page, `/queue/jobs`, lists the jobs in the browser.
 
 There are no leases, retries or locks. A claim is a read and then a write, which is safe
-for the one worker the queue has; two workers could claim the same event. A job whose
+for the one worker the queue has; two workers could claim the same job. A job whose
 worker dies stays `running` until something sets it otherwise.
 
 ## Who can see what

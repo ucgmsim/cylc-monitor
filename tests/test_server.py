@@ -294,9 +294,10 @@ def test_queue_permissions(monitor: dict) -> None:
     for actor in (None, "reader", "writer", "scan-writer"):  # only the queue-writer may insert
         assert post(f"{jobs}/-/insert", actor, row) == 403
     assert post(f"{jobs}/-/insert", "queue-writer", row) == 201
-    assert post(f"{jobs}/perm1/-/update", "reader", b'{"update": {"status": "x"}}') == 403
-    assert post(f"{jobs}/perm1/-/delete", "queue-writer", b"{}") == 403
-    assert post(f"{jobs}/perm1/-/update", "queue-writer", b'{"update": {"status": "cancelled"}}') == 200
+    job = sql(monitor, "select max(id) as id from jobs where event_id = 'perm1'", "queue")[0]["id"]
+    assert post(f"{jobs}/{job}/-/update", "reader", b'{"update": {"status": "x"}}') == 403
+    assert post(f"{jobs}/{job}/-/delete", "queue-writer", b"{}") == 403
+    assert post(f"{jobs}/{job}/-/update", "queue-writer", b'{"update": {"status": "cancelled"}}') == 200
     assert (
         post(f"{monitor['url']}/queue/-/create", "queue-writer", b'{"table": "t", "columns": [{"name": "a"}]}') == 403
     )
@@ -308,36 +309,36 @@ def test_queue_permissions(monitor: dict) -> None:
 
 
 def test_queue_round_trip(monitor: dict, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    q = queue.Queue(monitor["url"], monitor["queue-writer"])
+    q = queue.connect(url=monitor["url"], token=monitor["queue-writer"])
     cmt = {"Mw": 5.2, "strike1": 30}
     first = q.submit("2026p000001", cmt)
-    assert (first["status"], first["cmt"], first["task_id"]) == ("queued", cmt, None)
-    assert q.submit("2026p000001", {"Mw": 9})["cmt"] == cmt  # already queued: unchanged
-    q.submit("2026p000002", {"Mw": 4.5})
-    assert q.get("nope") is None
+    assert (first["event_id"], first["status"], first["cmt"], first["task_id"]) == ("2026p000001", "queued", cmt, None)
+    second = q.submit("2026p000002", {"Mw": 4.5})
+    assert second["id"] > first["id"]
+    assert q.get(10**9) is None
+    assert q.latest("nope") is None
 
     claimed = q.claim("realtime/run1//1")
     assert claimed is not None
-    assert (claimed["event_id"], claimed["status"], claimed["task_id"]) == (
-        "2026p000001",
-        "running",
-        "realtime/run1//1",
-    )
-    stored = q.get("2026p000001")
+    assert (claimed["id"], claimed["status"], claimed["task_id"]) == (first["id"], "running", "realtime/run1//1")
+    stored = q.get(first["id"])
     assert stored is not None
     assert (stored["status"], stored["task_id"]) == ("running", "realtime/run1//1")
     assert stored["updated"] >= stored["created"]
 
-    q.update("2026p000001", status="succeeded", detail="https://simdb/x")
-    assert (q.get("2026p000001") or {}).get("detail") == "https://simdb/x"
-    assert [j["event_id"] for j in q.jobs(status="queued")] == ["2026p000002"]
-    assert (q.claim() or {}).get("event_id") == "2026p000002"
-    assert q.claim() is None
+    q.update(first["id"], status="succeeded", detail="https://simdb/x")
+    assert (q.get(first["id"]) or {}).get("detail") == "https://simdb/x"
+    assert [j["id"] for j in q.jobs(status="queued")] == [second["id"]]
 
-    # An awkward key round-trips through Datasette's tilde encoding.
-    q.submit("odd id/with.dots~", None)
-    q.update("odd id/with.dots~", status="cancelled")
-    assert (q.get("odd id/with.dots~") or {}).get("status") == "cancelled"
+    # Submitting the event again, with a new CMT, queues it again: a new job, behind the
+    # one already queued, and the first stays as its history.
+    again = q.submit("2026p000001", {"Mw": 5.3})
+    assert again["id"] > second["id"] and again["status"] == "queued"
+    assert [j["status"] for j in q.jobs(event_id="2026p000001")] == ["succeeded", "queued"]
+    assert (q.latest("2026p000001") or {}).get("cmt") == {"Mw": 5.3}
+    assert (q.claim() or {}).get("id") == second["id"]
+    assert (q.claim() or {}).get("cmt") == {"Mw": 5.3}
+    assert q.claim() is None
 
     token_file = tmp_path / "queue-token"
     token_file.write_text(monitor["queue-writer"])
@@ -345,10 +346,15 @@ def test_queue_round_trip(monitor: dict, tmp_path: Path, capsys: pytest.CaptureF
     cmt_file = tmp_path / "cmt.json"
     cmt_file.write_text(json.dumps(cmt))
     assert queue.main([*cli, "submit", "2026p000003", "--cmt", str(cmt_file), "detail=from the cli"]) == 0
-    assert json.loads(capsys.readouterr().out)["detail"] == "from the cli"
+    job = json.loads(capsys.readouterr().out)
+    assert job["detail"] == "from the cli"
     assert queue.main([*cli, "claim", "--task-id", "realtime/run1//3"]) == 0
     assert json.loads(capsys.readouterr().out)["cmt"] == cmt
-    assert queue.main([*cli, "set", "2026p000003", "status=failed"]) == 0
-    assert queue.main([*cli, "get", "2026p000003"]) == 0
+    assert queue.main([*cli, "set", str(job["id"]), "status=failed"]) == 0
+    assert queue.main([*cli, "get", str(job["id"])]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "failed"
+    assert queue.main([*cli, "latest", "2026p000003"]) == 0
+    assert json.loads(capsys.readouterr().out)["id"] == job["id"]
+    assert queue.main([*cli, "list", "--event", "2026p000003"]) == 0
+    assert [j["id"] for j in json.loads(capsys.readouterr().out)] == [job["id"]]
     assert queue.main([*cli, "claim"]) == 1
