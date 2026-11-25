@@ -1,4 +1,4 @@
-# The monitor's Datasette: nothing for anonymous visitors. Four actors:
+# The monitor's Datasette: nothing for anonymous visitors. Five actors:
 #   admin        a person in the browser, logged in at /-/login (datasette-auth-passwords)
 #   cylc-writer  cylc_monitor_upload.py on the scheduler host: a token whose only use is
 #                POST /-/cylc/upload (plugins/cylc_upload.py checks the actor's id)
@@ -6,13 +6,29 @@
 #                and /-/scan/upload/cmt (plugins/scan_upload.py checks the actor's id)
 #   cylc-reader  whoever follows the runs off the cluster (a person's script, an agent):
 #                a token that may only read and run read-only SQL (make_token.py reader)
+#   queue-writer SeismicNow and the realtime workflow: a token that may only read the job
+#                queue (queue/jobs) and insert and update its rows (make_token.py queue-writer)
 title: Cylc monitor
-description: Cylc workflows' own databases, uploaded from the scheduler host as they change, and auto_scan's reviews.
+description: Cylc workflows' own databases, uploaded from the scheduler host as they change, auto_scan's reviews, and the realtime simulations' job queue.
 # Spacing and click-to-sort for the dashboard's tables (static/, served at /assets/ by --static).
 extra_css_urls: [/assets/dashboard.css]
 extra_js_urls: [/assets/dashboard.js]
 allow:
-  id: [admin, cylc-reader, cylc-writer, scan-writer]
+  id: [admin, cylc-reader, cylc-writer, scan-writer, queue-writer]
+# The job queue (queue.sql, created by plugins/queue_setup.py): SeismicNow inserts rows and the
+# realtime workflow updates them with Datasette's JSON write API. The admin may also delete
+# rows from the browser; nobody may alter or drop the table.
+databases:
+  queue:
+    tables:
+      jobs:
+        permissions:
+          insert-row:
+            id: [queue-writer, admin]
+          update-row:
+            id: [queue-writer, admin]
+          delete-row:
+            id: admin
 plugins:
   datasette-auth-passwords:
     admin_password_hash:

@@ -3,12 +3,14 @@
     python /app/make_token.py writer   # for cylc_monitor_upload.py on the scheduler host
     python /app/make_token.py reader   # for whoever follows the runs off the cluster
     python /app/make_token.py scan-writer   # for auto_scan's push (AUTO_SCAN_WRITER_TOKEN)
+    python /app/make_token.py queue-writer  # for SeismicNow and the realtime workflow
 
 The writer's only use is POST /-/cylc/upload (the plugin checks its actor id; the token
 itself may only view the instance), and the scan-writer's POST /-/scan/upload and
 /-/scan/upload/cmt, likewise; the reader may only read (tables, views and
-read-only SQL, hence the dashboards). None expires; rotate
-DATASETTE_SECRET to revoke every token at once.
+read-only SQL, hence the dashboards). The queue-writer may only read the job queue's
+table and insert and update its rows. None expires; rotate DATASETTE_SECRET to revoke
+every token at once.
 """
 
 import os
@@ -23,11 +25,17 @@ TOKENS = {
         "--all", "view-instance", "--all", "view-database", "--all", "view-table",
         "--all", "view-query", "--all", "execute-sql",
     ],
+    "queue-writer": [
+        "queue-writer",
+        "--all", "view-instance", "--database", "queue", "view-database",
+        "--resource", "queue", "jobs", "view-table",
+        "--resource", "queue", "jobs", "insert-row", "--resource", "queue", "jobs", "update-row",
+    ],
 }  # fmt: skip
 
 
 def main() -> None:
-    """Print the token named on the command line (writer, reader or scan-writer)."""
+    """Print the token named on the command line (writer, reader, scan-writer or queue-writer)."""
     if len(sys.argv) != 2 or sys.argv[1] not in TOKENS:
         sys.exit(__doc__)
     secret = os.environ["DATASETTE_SECRET"]

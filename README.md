@@ -39,10 +39,13 @@ scheduler (cluster)                              server (e.g. a VPS; reverse pro
     uploads one snapshot by hand.
   - `status.py`: the command `cylc-monitor-status`, the reader. It prints each active
     workflow's state and exits 1 if something needs a person.
+  - `queue.py`: the job queue's client, and the command `cylc-monitor-queue` (see
+    [The job queue](#the-job-queue)).
 - `server/`: the Datasette side, run with Docker Compose. It has the views
   (`schema.sql`), the permissions and dashboards (`datasette.yaml`), the upload plugin,
   a token maker and an example Caddy site. It also hosts auto_scan's databases (see
-  [auto_scan's databases](#auto_scans-databases)).
+  [auto_scan's databases](#auto_scans-databases)) and the realtime simulations' job
+  queue (see [The job queue](#the-job-queue)).
 - `examples/global.cylc`: the Cylc configuration that turns the plugin on.
 
 Datasette is pinned to 1.0a41 (for its tokens), datasette-auth-passwords to 1.1.1 and
@@ -254,16 +257,73 @@ it knows. When auto_scan changes its schema, change the plugin and the views her
 The `scan` and `cmt` databases start empty, so their dashboards error until their first
 upload.
 
+## The job queue
+
+The `queue` database holds one table, `jobs`: a list of earthquakes to simulate.
+SeismicNow adds an event when it decides the event can be simulated. The realtime
+workflow takes the oldest queued event, runs it, publishes the results to simdb and sets
+the event's status as it goes. Both write with Datasette's own JSON write API, with the
+`queue-writer` token. There is no endpoint of the monitor's own.
+
+| Column | Holds |
+|---|---|
+| `event_id` | the GeoNet PublicID, the primary key: submitting an event already there changes nothing |
+| `task_id` | what the worker calls the run, e.g. `realtime/run1//12` |
+| `cmt` | the CMT solution, as JSON |
+| `status` | free text; by convention `queued`, `running`, `succeeded`, `failed` or `cancelled` |
+| `detail` | free text: progress, an error, a link to the results |
+| `created`, `updated` | UTC timestamps, set by the database |
+
+`server/queue.sql` makes the table, and `plugins/queue_setup.py` runs it at startup.
+Only missing objects are created, so a restart keeps the queue.
+
+With the Python client (standard library only, in this package):
+```python
+from cylc_monitor.queue import connect
+
+q = connect()  # ~/.config/cylc-monitor/url and queue-token
+q.submit("2026p123456", cmt)  # SeismicNow; a no-op if the event is already there
+job = q.claim("realtime/run1//12")  # the worker: the oldest queued job, now running; None if none
+q.update("2026p123456", status="succeeded", detail="https://...")
+q.get("2026p123456")
+q.jobs(status="failed")
+```
+
+From a shell, e.g. a Cylc event handler:
+```sh
+cylc-monitor-queue submit 2026p123456 --cmt cmt.json
+cylc-monitor-queue claim --task-id realtime/run1//12   # prints the job as JSON; exits 1 if none
+cylc-monitor-queue set 2026p123456 status=failed detail="sw4 timed out"
+cylc-monitor-queue list --status queued
+```
+
+Or with plain HTTP, from anything:
+```sh
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"row": {"event_id": "2026p123456", "cmt": {...}}, "ignore": true}' https://cylc.example.org/queue/jobs/-/insert
+curl -H "Authorization: Bearer $TOKEN" 'https://cylc.example.org/queue/jobs.json?status=queued&_sort=created&_size=1&_shape=array'
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"update": {"status": "running"}}' https://cylc.example.org/queue/jobs/2026p123456/-/update
+```
+
+To re-run an event, set its status back to `queued`. To skip one, set it to
+`cancelled`. The table's page, `/queue/jobs`, lists the jobs in the browser.
+
+There are no leases, retries or locks. A claim is a read and then a write, which is safe
+for the one worker the queue has; two workers could claim the same event. A job whose
+worker dies stays `running` until something sets it otherwise.
+
 ## Who can see what
 
-Datasette lets in no anonymous visitors. There are four actors:
+Datasette lets in no anonymous visitors. There are five actors:
 
 | Actor | How | May |
 |---|---|---|
-| `admin` | a browser, at `/-/login` (password hash in `.env`) | read everything |
+| `admin` | a browser, at `/-/login` (password hash in `.env`) | read everything; insert, update and delete the job queue's rows |
 | `cylc-writer` | a token on the scheduler host, `~/.config/cylc-monitor/token` | upload snapshots; the upload plugin checks the actor's id, and the token may otherwise only view the instance |
 | `scan-writer` | a token in auto_scan's repository secret `AUTO_SCAN_WRITER_TOKEN` | upload auto_scan's databases; like `cylc-writer`, the token may otherwise only view the instance |
 | `cylc-reader` | a token wherever you read from, `~/.config/cylc-monitor/reader-token` | read tables and views, run read-only SQL, see the dashboards |
+| `queue-writer` | a token with SeismicNow and on the scheduler host, `~/.config/cylc-monitor/queue-token` | read the job queue (`queue/jobs`) and insert and update its rows; nothing else |
 
 Tokens are signed with `DATASETTE_SECRET` and don't expire. Changing the secret revokes
 every token.
@@ -296,8 +356,8 @@ These steps assume a host with Docker Compose and a reverse proxy that handles T
 3. **Start it:** `sudo docker compose up -d --build`. To check, run
    `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8017/`. It should print
    403: the server is running and closed to anonymous visitors. The databases are
-   `data/cylc.db`, `data/scan.db` and `data/cmt.db`. Each dashboard errors until its
-   first upload.
+   `data/cylc.db`, `data/scan.db`, `data/cmt.db` and `data/queue.db`. Each dashboard
+   errors until its first upload.
 4. **Reverse proxy:** adapt `Caddyfile.example` to your hostname, append it to
    `/etc/caddy/Caddyfile`, then run
    `sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy`.
@@ -345,6 +405,17 @@ These steps assume a host with Docker Compose and a reverse proxy that handles T
    ssh server rm cylc-monitor/scan-writer.token
    ```
    auto_scan also needs the server's URL, in its repository variable `DATASETTE_URL`.
+7. **The job queue's token:** make the `queue-writer` token. Put it on the scheduler host
+   as `~/.config/cylc-monitor/queue-token`, and give it to SeismicNow:
+   ```sh
+   cd ~/cylc-monitor
+   sudo docker compose exec -T datasette python /app/make_token.py queue-writer > queue-writer.token
+   chmod 600 queue-writer.token
+   # From your own machine:
+   ssh server cat cylc-monitor/queue-writer.token | ssh cluster 'umask 077; cat > ~/.config/cylc-monitor/queue-token'
+   # ...and to SeismicNow's secrets, however it keeps them. Then:
+   ssh server rm cylc-monitor/queue-writer.token
+   ```
 
 To update the server, copy the changed files over and run
 `sudo docker compose up -d --build` again. The views are remade at startup.
@@ -396,6 +467,7 @@ PBS run. The tests lay them over the run for a PBS workflow. The tests cover:
   - the `jobs` view;
   - that every dashboard query runs;
   - the status reader;
-  - auto_scan's uploads and dashboards.
+  - auto_scan's uploads and dashboards;
+  - the job queue: who may write it, and the client and command line end to end.
 - `tests/test_scan_upload.py`: auto_scan's upload plugin, its views and its dashboards'
   queries, on made-up databases (`tests/scan_snapshots.py`) with auto_scan's tables.
