@@ -25,6 +25,7 @@ Repository = "https://github.com/ucgmsim/cylc-monitor"
 [project.scripts]
 cylc-monitor-upload = "cylc_monitor.upload:run"
 cylc-monitor-status = "cylc_monitor.status:run"
+cylc-monitor-queue = "cylc_monitor.queue:run"
 
 [project.entry-points."cylc.main_loop"]
 # Turned on in global.cylc as `plugins = cylc monitor` (Cylc maps the space to `_`).

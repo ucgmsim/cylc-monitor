@@ -22,7 +22,7 @@ import make_token
 import pytest
 from scan_snapshots import make_cmt_snapshot, make_scan_snapshot
 
-from cylc_monitor import status, upload
+from cylc_monitor import queue, status, upload
 
 SERVER = Path(__file__).resolve().parent.parent / "server"
 RUN = Path(__file__).resolve().parent / "data" / "run"
@@ -68,7 +68,7 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
         "PATH": "/usr/bin:/bin",
     }
     process = subprocess.Popen(
-        [sys.executable, "-m", "datasette", "serve", *(str(directory / f"{db}.db") for db in ("cylc", "scan", "cmt")), "--create",
+        [sys.executable, "-m", "datasette", "serve", *(str(directory / f"{db}.db") for db in ("cylc", "scan", "cmt", "queue")), "--create",
          "--config", str(SERVER / "datasette.yaml"), "--plugins-dir", str(SERVER / "plugins"), "--static", f"assets:{SERVER / 'static'}",
          "--host", "127.0.0.1", "--port", str(port), "--setting", "force_https_urls", "1"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -90,6 +90,7 @@ def monitor(tmp_path_factory: pytest.TempPathFactory):
             "writer": token("writer"),
             "reader": token("reader"),
             "scan-writer": token("scan-writer"),
+            "queue-writer": token("queue-writer"),
         }
     finally:
         process.terminate()
@@ -147,7 +148,7 @@ def test_a_second_upload_replaces_the_first(monitor: dict, tmp_path: Path) -> No
     ]
     # The snapshots never become databases (or files) of their own.
     assert {p.name for p in monitor["db"].parent.iterdir()} <= {
-        f"{db}.db{suffix}" for db in ("cylc", "scan", "cmt") for suffix in ("", "-wal", "-shm")
+        f"{db}.db{suffix}" for db in ("cylc", "scan", "cmt", "queue") for suffix in ("", "-wal", "-shm")
     }
 
 
@@ -274,3 +275,80 @@ def test_auto_scan_upload(monitor: dict, tmp_path: Path) -> None:
     for board in ("scan", "cmt"):
         status_code, page = request(f"{monitor['url']}/-/dashboards/{board}", monitor["reader"])
         assert status_code == 200, page
+
+
+def test_queue_permissions(monitor: dict) -> None:
+    jobs = f"{monitor['url']}/queue/jobs"
+    row = json.dumps({"row": {"event_id": "perm1"}}).encode()
+
+    def post(path: str, actor: str | None, body: bytes) -> int:
+        headers = {"Content-Type": "application/json"} | (
+            {"Authorization": f"Bearer {monitor[actor]}"} if actor else {}
+        )
+        try:
+            with urllib.request.urlopen(urllib.request.Request(path, data=body, headers=headers), timeout=10) as r:
+                return r.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    for actor in (None, "reader", "writer", "scan-writer"):  # only the queue-writer may insert
+        assert post(f"{jobs}/-/insert", actor, row) == 403
+    assert post(f"{jobs}/-/insert", "queue-writer", row) == 201
+    assert post(f"{jobs}/perm1/-/update", "reader", b'{"update": {"status": "x"}}') == 403
+    assert post(f"{jobs}/perm1/-/delete", "queue-writer", b"{}") == 403
+    assert post(f"{jobs}/perm1/-/update", "queue-writer", b'{"update": {"status": "cancelled"}}') == 200
+    assert (
+        post(f"{monitor['url']}/queue/-/create", "queue-writer", b'{"table": "t", "columns": [{"name": "a"}]}') == 403
+    )
+    # The queue-writer reads the queue, and nothing else; the reader reads it too.
+    assert request(f"{jobs}.json", monitor["queue-writer"])[0] == 200
+    assert request(f"{monitor['url']}/cylc/jobs.json", monitor["queue-writer"])[0] == 403
+    assert request(f"{monitor['url']}/cylc.json?sql=select+1", monitor["queue-writer"])[0] == 403
+    assert request(f"{jobs}.json", monitor["reader"])[0] == 200
+
+
+def test_queue_round_trip(monitor: dict, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    q = queue.Queue(monitor["url"], monitor["queue-writer"])
+    cmt = {"Mw": 5.2, "strike1": 30}
+    first = q.submit("2026p000001", cmt)
+    assert (first["status"], first["cmt"], first["task_id"]) == ("queued", cmt, None)
+    assert q.submit("2026p000001", {"Mw": 9})["cmt"] == cmt  # already queued: unchanged
+    q.submit("2026p000002", {"Mw": 4.5})
+    assert q.get("nope") is None
+
+    claimed = q.claim("realtime/run1//1")
+    assert claimed is not None
+    assert (claimed["event_id"], claimed["status"], claimed["task_id"]) == (
+        "2026p000001",
+        "running",
+        "realtime/run1//1",
+    )
+    stored = q.get("2026p000001")
+    assert stored is not None
+    assert (stored["status"], stored["task_id"]) == ("running", "realtime/run1//1")
+    assert stored["updated"] >= stored["created"]
+
+    q.update("2026p000001", status="succeeded", detail="https://simdb/x")
+    assert (q.get("2026p000001") or {}).get("detail") == "https://simdb/x"
+    assert [j["event_id"] for j in q.jobs(status="queued")] == ["2026p000002"]
+    assert (q.claim() or {}).get("event_id") == "2026p000002"
+    assert q.claim() is None
+
+    # An awkward key round-trips through Datasette's tilde encoding.
+    q.submit("odd id/with.dots~", None)
+    q.update("odd id/with.dots~", status="cancelled")
+    assert (q.get("odd id/with.dots~") or {}).get("status") == "cancelled"
+
+    token_file = tmp_path / "queue-token"
+    token_file.write_text(monitor["queue-writer"])
+    cli = ["--url", monitor["url"], "--token-file", str(token_file)]
+    cmt_file = tmp_path / "cmt.json"
+    cmt_file.write_text(json.dumps(cmt))
+    assert queue.main([*cli, "submit", "2026p000003", "--cmt", str(cmt_file), "detail=from the cli"]) == 0
+    assert json.loads(capsys.readouterr().out)["detail"] == "from the cli"
+    assert queue.main([*cli, "claim", "--task-id", "realtime/run1//3"]) == 0
+    assert json.loads(capsys.readouterr().out)["cmt"] == cmt
+    assert queue.main([*cli, "set", "2026p000003", "status=failed"]) == 0
+    assert queue.main([*cli, "get", "2026p000003"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "failed"
+    assert queue.main([*cli, "claim"]) == 1
