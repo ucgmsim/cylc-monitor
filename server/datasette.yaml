@@ -1,5 +1,6 @@
-# The monitor's Datasette: nothing for anonymous visitors. Five actors:
-#   admin        a person in the browser, logged in at /-/login (datasette-auth-passwords)
+# The monitor's Datasette: nothing for anonymous visitors. Six actors:
+#   admin, joel  people in the browser, logged in at /-/login (datasette-auth-passwords),
+#                each with their own password; both may do what the admin may
 #   cylc-writer  cylc_monitor_upload.py on the scheduler host: a token whose only use is
 #                POST /-/cylc/upload (plugins/cylc_upload.py checks the actor's id)
 #   scan-writer  auto_scan's `auto-scan push`: a token whose only use is POST /-/scan/upload
@@ -14,25 +15,28 @@ description: Cylc workflows' own databases, uploaded from the scheduler host as 
 extra_css_urls: [/assets/dashboard.css]
 extra_js_urls: [/assets/dashboard.js]
 allow:
-  id: [admin, cylc-reader, cylc-writer, scan-writer, queue-writer]
+  id: [admin, joel, cylc-reader, cylc-writer, scan-writer, queue-writer]
 # The job queue (queue.sql, created by plugins/queue_setup.py): SeismicNow inserts rows and the
-# realtime workflow updates them with Datasette's JSON write API. The admin may also delete
-# rows from the browser; nobody may alter or drop the table.
+# realtime workflow updates them with Datasette's JSON write API. The people logged in may also
+# delete rows from the browser; nobody may alter or drop the table.
 databases:
   queue:
     tables:
       jobs:
         permissions:
           insert-row:
-            id: [queue-writer, admin]
+            id: [queue-writer, admin, joel]
           update-row:
-            id: [queue-writer, admin]
+            id: [queue-writer, admin, joel]
           delete-row:
-            id: admin
+            id: [admin, joel]
 plugins:
+  # A login for each <user>_password_hash; the user's actor is {"id": "<user>"}.
   datasette-auth-passwords:
     admin_password_hash:
       $env: ADMIN_PASSWORD_HASH
+    joel_password_hash:
+      $env: JOEL_PASSWORD_HASH
   # /-/dashboards/cylc. Active workflows: those not stopped (running, paused, stalled or silent),
   # read off monitor.status rather than the workflows view, which would compute jobs twice.
   datasette-dashboards:
