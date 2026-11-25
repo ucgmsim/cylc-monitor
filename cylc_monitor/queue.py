@@ -30,6 +30,7 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -57,24 +58,23 @@ def tilde_encode(value: str) -> str:
     return "".join(chr(b) if b in SAFE else "+" if b == ord(" ") else f"~{b:02X}" for b in value.encode())
 
 
+@dataclass
 class Queue:
-    """The job queue on the monitor."""
+    """The job queue on the monitor.
 
-    def __init__(self, url: str, token: str, timeout: float = 30) -> None:
-        """Point at the monitor's queue.
+    Parameters
+    ----------
+    url : str
+        The monitor's URL.
+    token : str
+        The monitor's queue-writer token (or, to only read, its reader token).
+    timeout : float, optional
+        Seconds to wait for each request (default 30).
+    """
 
-        Parameters
-        ----------
-        url : str
-            The monitor's URL.
-        token : str
-            The monitor's queue-writer token (or, to only read, its reader token).
-        timeout : float, optional
-            Seconds to wait for each request (default 30).
-        """
-        self.url = url.rstrip("/")
-        self.token = token
-        self.timeout = timeout
+    url: str
+    token: str
+    timeout: float = 30
 
     def _request(self, path: str, body: dict[str, Any] | None = None) -> Any:
         """Send a request to the monitor and decode its JSON reply.
@@ -96,7 +96,7 @@ class Queue:
         if body is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(body).encode()
-        request = urllib.request.Request(f"{self.url}/{path}", data=data, headers=headers)
+        request = urllib.request.Request(f"{self.url.rstrip('/')}/{path}", data=data, headers=headers)
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             return json.load(response)
 
